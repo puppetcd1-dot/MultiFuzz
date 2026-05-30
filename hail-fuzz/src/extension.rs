@@ -315,6 +315,23 @@ impl FuzzerStage for MultiStreamExtendStage {
                         new_mmio_addr = true;
                         fuzzer.get_extension_factor(addr)
                     });
+
+                    // Phase A: structural MMIO dependency inference for the new stream.
+                    // Run at the moment of first detection — no re-execution needed.
+                    if new_mmio_addr {
+                        let readwatch_pc = fuzzer.vm.cpu.read_pc();
+                        let candidates = fuzzer
+                            .mmio_flow
+                            .candidates_for_new_stream(readwatch_pc, &fuzzer.vm.code);
+                        if !candidates.is_empty() {
+                            tracing::debug!(
+                                "Phase A: new MMIO {addr:#x} at PC {readwatch_pc:#x} — \
+                                 {} structural candidate(s): {:?}",
+                                candidates.len(), candidates
+                            );
+                            fuzzer.relation_graph.add_structural_candidates(addr, &candidates);
+                        }
+                    }
                 };
             }
 

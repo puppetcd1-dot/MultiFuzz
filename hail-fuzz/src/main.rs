@@ -8,10 +8,13 @@ mod havoc;
 mod i2s;
 mod input;
 mod load_resizer;
+mod mmio_flow;
 mod monitor;
 mod mutations;
 mod p2im_unit_tests;
 mod queue;
+mod stream_relation;
+mod taint;
 mod trim;
 mod utils;
 
@@ -43,9 +46,11 @@ use crate::{
     extension::LengthExtData,
     input::{CortexmMultiStream, MultiStream, StreamKey},
     load_resizer::LoadResizeInjector,
+    mmio_flow::MmioFlowAnalyzer,
     monitor::{CrashLogger, Monitor},
     mutations::random_input,
     queue::{CorpusStore, CoverageQueue, GlobalQueue, GlobalRef, InputId, InputQueue, InputSource},
+    stream_relation::StreamRelationGraph,
 };
 
 fn main() {
@@ -530,6 +535,10 @@ pub(crate) struct Fuzzer {
     pub features: config::EnabledFeatures,
     /// Controls which debugging features should be enabled.
     pub debug: config::DebugSettings,
+    /// Directed graph of structural and taint-confirmed dependencies between MMIO streams.
+    pub relation_graph: StreamRelationGraph,
+    /// Phase A: structural MMIO dependency analyzer (P-code backward demand slice).
+    pub mmio_flow: MmioFlowAnalyzer,
 }
 
 impl Fuzzer {
@@ -597,6 +606,20 @@ impl Fuzzer {
 
         let crash_logger = CrashLogger::new(&config)?;
 
+        // Build MMIO ranges from the firmware config for Phase A structural analysis.
+        let mmio_ranges: Vec<std::ops::Range<u64>> = config
+            .firmware
+            .memory_map
+            .iter()
+            .filter(|(name, _)| name.starts_with("mmio"))
+            .map(|(_, mem)| mem.base_addr..mem.base_addr + mem.size)
+            .collect();
+        let mmio_flow = if mmio_ranges.is_empty() {
+            MmioFlowAnalyzer::cortexm_default()
+        } else {
+            MmioFlowAnalyzer::new(mmio_ranges)
+        };
+
         let mut global_dict = Dictionary::default();
         if let Some(dict_path) = std::env::var_os("DICTIONARY") {
             let input = std::fs::read_to_string(&dict_path).with_context(|| {
@@ -640,6 +663,8 @@ impl Fuzzer {
             re_prioritization_inputs: 0,
             features,
             debug: DebugSettings::from_env()?,
+            relation_graph: StreamRelationGraph::new(),
+            mmio_flow,
         })
     }
 
