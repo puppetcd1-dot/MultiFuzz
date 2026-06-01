@@ -1,6 +1,6 @@
 use hashbrown::HashMap;
 
-use crate::input::StreamKey;
+use crate::stream_relation::AccessContext;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // TaintTag
@@ -170,11 +170,14 @@ impl<'a> Iterator for TagIter<'a> {
 // StreamIndex
 // ──────────────────���───────────────────────────────────────────────────────────
 
-/// Maps StreamKeys to compact bit-indices used in TaintTags.
+/// Maps `AccessContext`s to compact bit-indices used in TaintTags.
+///
+/// Keying by `(PC, address)` rather than address alone lets Phase B distinguish
+/// taint from the same peripheral register read at different call sites.
 pub struct StreamIndex {
-    key_to_bit: HashMap<StreamKey, usize>,
+    key_to_bit: HashMap<AccessContext, usize>,
     next_bit:   usize,
-    /// Once this many streams are indexed, new streams get the overflow bit instead.
+    /// Once this many contexts are indexed, new ones get the overflow bit instead.
     max_streams: usize,
 }
 
@@ -187,33 +190,33 @@ impl StreamIndex {
         Self::new(256)
     }
 
-    /// Get or assign the bit index for a stream key.
-    pub fn get_or_insert(&mut self, key: StreamKey) -> Option<usize> {
-        if let Some(&idx) = self.key_to_bit.get(&key) {
+    /// Get or assign the bit index for an access context.
+    pub fn get_or_insert(&mut self, ctx: AccessContext) -> Option<usize> {
+        if let Some(&idx) = self.key_to_bit.get(&ctx) {
             return Some(idx);
         }
         if self.next_bit >= self.max_streams {
             tracing::warn!(
-                "TaintTag overflow: more than {} MMIO streams in a single taint pass; \
-                 new stream {:#x} will use overflow sentinel",
-                self.max_streams, key
+                "TaintTag overflow: more than {} MMIO access contexts in a single taint pass; \
+                 context (pc={:#x}, addr={:#x}) will use overflow sentinel",
+                self.max_streams, ctx.pc, ctx.addr
             );
             return None; // Caller should set OVERFLOW_BIT
         }
         let idx = self.next_bit;
         self.next_bit += 1;
-        self.key_to_bit.insert(key, idx);
+        self.key_to_bit.insert(ctx, idx);
         Some(idx)
     }
 
-    /// Resolve a bit index back to a stream key (for reporting results).
-    pub fn bit_to_key(&self, bit: usize) -> Option<StreamKey> {
+    /// Resolve a bit index back to its access context (for reporting results).
+    pub fn bit_to_ctx(&self, bit: usize) -> Option<AccessContext> {
         self.key_to_bit.iter().find(|(_, &v)| v == bit).map(|(&k, _)| k)
     }
 
-    /// Collect all stream keys whose bits are set in `tag`.
-    pub fn streams_in_tag(&self, tag: &TaintTag) -> Vec<StreamKey> {
-        tag.iter_streams().filter_map(|bit| self.bit_to_key(bit)).collect()
+    /// Collect all access contexts whose bits are set in `tag`.
+    pub fn contexts_in_tag(&self, tag: &TaintTag) -> Vec<AccessContext> {
+        tag.iter_streams().filter_map(|bit| self.bit_to_ctx(bit)).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -253,17 +256,19 @@ impl ShadowState {
 
     // ── Source injection ────────────────────────────────────────────────────
 
-    /// Mark `size` bytes at `phys_addr` as tainted by `stream_key`.
+    /// Mark `size` bytes at `phys_addr` as tainted by the access context `ctx`.
     /// Called at each MMIO read (Phase B source hook in `mmio.rs`).
-    pub fn taint_mmio_read(&mut self, stream_key: StreamKey, phys_addr: u32, size: usize) {
-        let tag = self.tag_for_stream(stream_key);
+    /// Using the full `(PC, address)` context ensures that the same peripheral
+    /// register read at different call sites gets separate taint bits.
+    pub fn taint_mmio_read(&mut self, ctx: AccessContext, phys_addr: u32, size: usize) {
+        let tag = self.tag_for_context(ctx);
         for i in 0..size as u32 {
             self.mem.insert(phys_addr + i, tag.clone());
         }
     }
 
-    fn tag_for_stream(&mut self, key: StreamKey) -> TaintTag {
-        match self.index.get_or_insert(key) {
+    fn tag_for_context(&mut self, ctx: AccessContext) -> TaintTag {
+        match self.index.get_or_insert(ctx) {
             Some(bit_idx) => {
                 let mut tag = TaintTag::Clean;
                 tag.set_stream(bit_idx);
@@ -389,14 +394,15 @@ impl ShadowState {
 
     // ── Sink checks ─────────────────────────────────────────────────────────
 
-    /// Returns the set of StreamKeys that taint the given register.
-    pub fn tainted_streams_in_reg(&self, var_id: i16) -> Vec<StreamKey> {
-        self.index.streams_in_tag(&self.reg_tag(var_id))
+    /// Returns the access contexts that taint the given register.
+    /// Callers that only need the stream address can project via `.addr`.
+    pub fn tainted_contexts_in_reg(&self, var_id: i16) -> Vec<AccessContext> {
+        self.index.contexts_in_tag(&self.reg_tag(var_id))
     }
 
-    /// Returns the set of StreamKeys that taint a memory range.
-    pub fn tainted_streams_in_mem(&self, addr: u32, size: usize) -> Vec<StreamKey> {
-        self.index.streams_in_tag(&self.mem_tag_range(addr, size))
+    /// Returns the access contexts that taint a memory range.
+    pub fn tainted_contexts_in_mem(&self, addr: u32, size: usize) -> Vec<AccessContext> {
+        self.index.contexts_in_tag(&self.mem_tag_range(addr, size))
     }
 
     /// True if the tag has the overflow sentinel — attribution is uncertain.

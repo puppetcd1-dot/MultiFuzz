@@ -9,6 +9,7 @@ use crate::{
     input::{MultiStream, StreamKey},
     monitor,
     mutations::extend_input_by_rand,
+    stream_relation::AccessContext,
     DictionaryRef, Fuzzer, FuzzerStage, Snapshot, Stage, StageExit,
 };
 
@@ -320,6 +321,7 @@ impl FuzzerStage for MultiStreamExtendStage {
                     // Run at the moment of first detection — no re-execution needed.
                     if new_mmio_addr {
                         let readwatch_pc = fuzzer.vm.cpu.read_pc();
+                        let target_ctx = AccessContext::new(readwatch_pc, addr);
                         let candidates = fuzzer
                             .mmio_flow
                             .candidates_for_new_stream(readwatch_pc, &fuzzer.vm.code);
@@ -329,7 +331,7 @@ impl FuzzerStage for MultiStreamExtendStage {
                                  {} structural candidate(s): {:?}",
                                 candidates.len(), candidates
                             );
-                            fuzzer.relation_graph.add_structural_candidates(addr, &candidates);
+                            fuzzer.relation_graph.add_structural_candidates(target_ctx, &candidates);
                         }
                     }
                 };

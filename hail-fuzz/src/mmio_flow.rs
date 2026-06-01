@@ -7,7 +7,7 @@ use icicle_vm::{
 };
 use pcode::{Op, Value, VarId};
 
-use crate::input::StreamKey;
+use crate::stream_relation::AccessContext;
 
 /// Traversal depth when crossing function call boundaries.
 const MAX_CALL_LEVELS: usize = 3;
@@ -28,8 +28,10 @@ const MAX_CALL_LEVELS: usize = 3;
 pub struct DemandSlice {
     /// VarNode IDs whose defining instruction we are looking for.
     pub demanded: HashSet<VarId>,
-    /// MMIO addresses found as structural sources for the demanded varnodes.
-    pub sources:  HashSet<u64>,
+    /// MMIO access contexts (PC, address) found as structural sources for the
+    /// demanded varnodes.  Recorded at PC granularity so that the same MMIO
+    /// address accessed at different sites produces distinct source contexts.
+    pub sources:  HashSet<AccessContext>,
 }
 
 impl DemandSlice {
@@ -76,7 +78,10 @@ impl DemandSlice {
                     match addr_val {
                         Value::Const(addr, _) => {
                             if mmio_ranges.iter().any(|r| r.contains(&addr)) {
-                                self.sources.insert(addr);
+                                // Record the source at (instruction PC, MMIO address) so
+                                // that the same peripheral register accessed at different
+                                // PCs produces distinct source contexts.
+                                self.sources.insert(AccessContext::new(stmt_pcs[idx], addr));
                             }
                             // If addr is not in MMIO range (e.g., a RAM load), demand the
                             // address itself in case it was computed from an MMIO value.
@@ -88,7 +93,6 @@ impl DemandSlice {
                         }
                         _ => {}
                     }
-                    let _ = idx; // stmt_pcs[idx] available if StreamKey needs PC
                 }
 
                 Op::Copy | Op::ZeroExtend | Op::SignExtend | Op::Subpiece(_) => {
@@ -246,16 +250,17 @@ impl MmioFlowAnalyzer {
         ])
     }
 
-    /// Find all MMIO stream keys that structurally govern the access to a new stream B at
+    /// Find all MMIO access contexts that structurally govern the access to a new stream B at
     /// `readwatch_pc`.
     ///
-    /// Returns an empty vec if no translated blocks are available or no governing streams
-    /// can be identified.
+    /// Returns an empty vec if no translated blocks are available or no governing contexts
+    /// can be identified.  Each returned `AccessContext` carries the PC at which the source
+    /// MMIO load appears, enabling the caller to build context-level edges in the graph.
     pub fn candidates_for_new_stream(
         &self,
         readwatch_pc: u64,
         code: &BlockTable,
-    ) -> Vec<StreamKey> {
+    ) -> Vec<AccessContext> {
         let Some(block) = find_block_containing(code, readwatch_pc) else {
             return vec![];
         };

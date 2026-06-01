@@ -2,6 +2,31 @@ use hashbrown::HashMap;
 
 use crate::input::StreamKey;
 
+// ──────────────────────────────────────────────────────────────────────────────
+// AccessContext
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Fine-grained edge endpoint: the PC at which a stream was accessed together
+/// with the stream's MMIO address.
+///
+/// Streams (fuzzable units) remain address-keyed; edges inside
+/// `StreamRelationGraph` are recorded at context granularity so that
+/// multiple semantic roles of the same address register (e.g. a status
+/// register checked at two different PCs) produce distinct edges.
+/// The mutator-facing API (`governors`, `dependents`) projects those
+/// context edges back onto address-keyed streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AccessContext {
+    pub pc:   u64,
+    pub addr: StreamKey,
+}
+
+impl AccessContext {
+    pub fn new(pc: u64, addr: StreamKey) -> Self {
+        Self { pc, addr }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     /// Source stream may structurally govern target; type not yet classified.
@@ -89,8 +114,10 @@ impl Relation {
 
 #[derive(Debug, Clone)]
 pub struct StreamEdge {
-    pub source:     StreamKey,
-    pub target:     StreamKey,
+    /// Access context of the governing stream (source of the dependency).
+    pub source:     AccessContext,
+    /// Access context of the governed stream (target of the dependency).
+    pub target:     AccessContext,
     pub kind:       EdgeKind,
     pub confidence: Confidence,
     /// Populated for confirmed Length edges: maps val_A → expected count_B.
@@ -111,10 +138,12 @@ impl StreamRelationGraph {
     }
 
     /// Add structurally-inferred candidate edges (Phase A output).
-    /// Each entry in `sources` is an MMIO stream key that may govern `target`.
-    pub fn add_structural_candidates(&mut self, target: StreamKey, sources: &[StreamKey]) {
+    ///
+    /// Both endpoints carry `(PC, address)` context.  The index maps are keyed by
+    /// address so the mutator-facing `governors`/`dependents` projection stays O(1).
+    pub fn add_structural_candidates(&mut self, target: AccessContext, sources: &[AccessContext]) {
         for &source in sources {
-            if source == target || self.has_edge(source, target) {
+            if source.addr == target.addr || self.has_edge(source, target) {
                 continue;
             }
             let idx = self.edges.len();
@@ -125,21 +154,21 @@ impl StreamRelationGraph {
                 confidence: Confidence::Structural,
                 relation: None,
             });
-            self.outgoing.entry(source).or_default().push(idx);
-            self.incoming.entry(target).or_default().push(idx);
+            self.outgoing.entry(source.addr).or_default().push(idx);
+            self.incoming.entry(target.addr).or_default().push(idx);
         }
     }
 
     /// Confirm or upgrade an edge from taint analysis (Phase B output).
     pub fn confirm_edge(
         &mut self,
-        source: StreamKey,
-        target: StreamKey,
+        source: AccessContext,
+        target: AccessContext,
         kind: EdgeKind,
         relation: Option<Relation>,
     ) {
-        // Upgrade an existing structural candidate if one exists.
-        if let Some(indices) = self.incoming.get(&target).cloned() {
+        // Upgrade an existing structural candidate if one exists (exact context match).
+        if let Some(indices) = self.incoming.get(&target.addr).cloned() {
             for idx in indices {
                 let edge = &mut self.edges[idx];
                 if edge.source == source {
@@ -161,23 +190,24 @@ impl StreamRelationGraph {
             confidence: Confidence::TaintConfirmed,
             relation,
         });
-        self.outgoing.entry(source).or_default().push(idx);
-        self.incoming.entry(target).or_default().push(idx);
+        self.outgoing.entry(source.addr).or_default().push(idx);
+        self.incoming.entry(target.addr).or_default().push(idx);
     }
 
-    pub fn has_edge(&self, source: StreamKey, target: StreamKey) -> bool {
+    /// True if an edge with this exact context pair already exists.
+    pub fn has_edge(&self, source: AccessContext, target: AccessContext) -> bool {
         self.incoming
-            .get(&target)
+            .get(&target.addr)
             .map_or(false, |v| v.iter().any(|&i| self.edges[i].source == source))
     }
 
-    /// All edges whose target is `target`.
+    /// All edges whose target address is `target` (address-keyed projection for mutator).
     pub fn governors(&self, target: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.incoming.get(&target).map(|v| v.as_slice()).unwrap_or(&[]);
         indices.iter().map(|&i| &self.edges[i])
     }
 
-    /// All edges whose source is `source`.
+    /// All edges whose source address is `source` (address-keyed projection for mutator).
     pub fn dependents(&self, source: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.outgoing.get(&source).map(|v| v.as_slice()).unwrap_or(&[]);
         indices.iter().map(|&i| &self.edges[i])
