@@ -193,9 +193,18 @@ fn build_reverse_cfg(code: &BlockTable) -> ReverseCfg {
     let mut reverse: ReverseCfg = HashMap::new();
     for block in &code.blocks {
         let is_call = matches!(block.exit, BlockExit::Call { .. });
-        for target in block.exit.targets() {
-            if let Target::External(Value::Const(addr, _)) = target {
-                reverse.entry(addr).or_default().push((block.start, is_call));
+        for (i, target) in block.exit.targets().enumerate() {
+            // For Call exits: targets()[0] is the callee, targets()[1] is the fall-through
+            // return site. Only the callee edge crosses a function boundary.
+            let edge_is_call = is_call && i == 0;
+            let target_addr: Option<u64> = match target {
+                Target::External(Value::Const(addr, _)) => Some(addr),
+                // Internal indices address code.blocks directly (intra-function edges).
+                Target::Internal(idx) => code.blocks.get(idx).map(|b| b.start),
+                _ => None,
+            };
+            if let Some(addr) = target_addr {
+                reverse.entry(addr).or_default().push((block.start, edge_is_call));
             }
         }
     }
@@ -299,10 +308,11 @@ impl MmioFlowAnalyzer {
                 continue;
             };
 
-            // Temporarily strip temporaries before crossing into a new block, then
-            // process the block.  Within the block, temporaries may be tracked again.
-            slice.strip_temporaries();
+            // Process the block first so the seed block's P-code temporaries are
+            // resolved before they are stripped.  Temporaries don't survive to
+            // predecessor blocks, so strip them after processing.
             slice.process_block_backward(block, &self.mmio_ranges);
+            slice.strip_temporaries();
 
             let Some(predecessors) = reverse_cfg.get(&block.start) else {
                 continue;

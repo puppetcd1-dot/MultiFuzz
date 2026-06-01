@@ -107,7 +107,19 @@ impl TaintTag {
 
     /// Check whether this tag has any bit set in common with `other`.
     pub fn overlaps(&self, other: &TaintTag) -> bool {
-        !self.union(other).is_clean()
+        match (self, other) {
+            (TaintTag::Clean, _) | (_, TaintTag::Clean) => false,
+            (TaintTag::Inline(a), TaintTag::Inline(b)) => a & b != 0,
+            (TaintTag::Chunked(a), TaintTag::Chunked(b)) => {
+                let len = a.len().min(b.len());
+                (0..len).any(|i| a[i] & b[i] != 0)
+            }
+            (TaintTag::Inline(a), TaintTag::Chunked(b))
+            | (TaintTag::Chunked(b), TaintTag::Inline(a)) => {
+                // Inline bits 0-61 are all held in chunk 0 of a Chunked tag.
+                b.first().map_or(false, |&chunk0| chunk0 & a != 0)
+            }
+        }
     }
 
     /// Iterate over the stream indices set in this tag.
