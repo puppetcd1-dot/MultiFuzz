@@ -139,10 +139,15 @@ impl StreamRelationGraph {
 
     /// Add structurally-inferred candidate edges (Phase A output).
     ///
-    /// Both endpoints carry `(PC, address)` context.  The index maps are keyed by
-    /// address so the mutator-facing `governors`/`dependents` projection stays O(1).
-    pub fn add_structural_candidates(&mut self, target: AccessContext, sources: &[AccessContext]) {
-        for &source in sources {
+    /// Each source carries its `(PC, address)` context and a structurally-inferred
+    /// `EdgeKind` (`Address` or `Control`).  The index maps are keyed by address so the
+    /// mutator-facing `governors`/`dependents` projection stays O(1).
+    pub fn add_structural_candidates(
+        &mut self,
+        target: AccessContext,
+        sources: &[(AccessContext, EdgeKind)],
+    ) {
+        for &(source, kind) in sources {
             if source.addr == target.addr || self.has_edge(source, target) {
                 continue;
             }
@@ -150,7 +155,7 @@ impl StreamRelationGraph {
             self.edges.push(StreamEdge {
                 source,
                 target,
-                kind: EdgeKind::Unclassified,
+                kind,
                 confidence: Confidence::Structural,
                 relation: None,
             });
@@ -167,11 +172,12 @@ impl StreamRelationGraph {
         kind: EdgeKind,
         relation: Option<Relation>,
     ) {
-        // Upgrade an existing structural candidate if one exists (exact context match).
+        // Upgrade an existing structural candidate if one exists (exact context match on
+        // both endpoints — several targets may share an address at different PCs).
         if let Some(indices) = self.incoming.get(&target.addr).cloned() {
             for idx in indices {
                 let edge = &mut self.edges[idx];
-                if edge.source == source {
+                if edge.source == source && edge.target == target {
                     edge.kind = kind;
                     edge.confidence = Confidence::TaintConfirmed;
                     if relation.is_some() {
@@ -219,5 +225,54 @@ impl StreamRelationGraph {
 
     pub fn edge_count(&self) -> usize {
         self.edges.len()
+    }
+
+    /// Mutation-assistance hook: how much more often a stream at `addr` should be mutated
+    /// because it participates in inter-stream dependencies.  Returns a multiplier ≥ 1.0.
+    ///
+    /// Value-flow edges (Address/Length/Stride) are robust to address-keying and get the
+    /// strongest boost; Control edges are coarser (the same status register may be checked
+    /// at several sites) and get a smaller boost.  A `TaintConfirmed` edge is weighted above
+    /// a merely `Structural` one.
+    pub fn mutation_weight_factor(&self, addr: StreamKey) -> f64 {
+        let mut factor = 1.0_f64;
+        for list in [self.incoming.get(&addr), self.outgoing.get(&addr)].into_iter().flatten() {
+            for &idx in list {
+                let edge = &self.edges[idx];
+                let base = match edge.kind {
+                    EdgeKind::Address | EdgeKind::Length | EdgeKind::Stride => 4.0,
+                    EdgeKind::Control | EdgeKind::Unclassified => 2.0,
+                };
+                let confirmed_bonus = match edge.confidence {
+                    Confidence::TaintConfirmed => 1.5,
+                    Confidence::Structural => 1.0,
+                };
+                factor = factor.max(base * confirmed_bonus);
+            }
+        }
+        factor
+    }
+
+    /// Serialize the graph as a JSON array of edges (for offline evaluation / debugging).
+    pub fn to_json(&self) -> String {
+        let mut s = String::from("[\n");
+        for (i, e) in self.edges.iter().enumerate() {
+            if i > 0 {
+                s.push_str(",\n");
+            }
+            let relation = match &e.relation {
+                Some(r) => format!("{:?}", r.kind),
+                None => "none".to_string(),
+            };
+            s.push_str(&format!(
+                "  {{\"source_pc\":\"{:#x}\",\"source_addr\":\"{:#x}\",\
+                 \"target_pc\":\"{:#x}\",\"target_addr\":\"{:#x}\",\
+                 \"kind\":\"{:?}\",\"confidence\":\"{:?}\",\"relation\":\"{}\"}}",
+                e.source.pc, e.source.addr, e.target.pc, e.target.addr,
+                e.kind, e.confidence, relation
+            ));
+        }
+        s.push_str("\n]\n");
+        s
     }
 }

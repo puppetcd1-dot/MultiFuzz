@@ -181,6 +181,12 @@ pub(crate) fn get_stream_weights(
     // the mutation probability of fully colorized streams.
     const COLORIZATION_THRESHOLD: f64 = 0.99;
 
+    // Mutation assistance: streams that participate in inter-stream dependency relations
+    // (Phase A/B) are biased to be mutated more often.  Computed up-front so the borrow of
+    // `relation_graph` does not overlap the `corpus` borrow below.
+    let relation_boosts: Vec<f64> =
+        streams.iter().map(|(key, _)| fuzzer.relation_graph.mutation_weight_factor(*key)).collect();
+
     let color =
         fuzzer.corpus[id].stage_data::<hashbrown::HashMap<StreamKey, usize>>(Stage::Colorization);
     let colorization_rates: Vec<_> = streams
@@ -193,7 +199,8 @@ pub(crate) fn get_stream_weights(
         .collect();
     let weights = colorization_rates
         .into_iter()
-        .map(|x| if x > COLORIZATION_THRESHOLD { 0.01 } else { 1.0 })
+        .zip(relation_boosts)
+        .map(|(x, boost)| (if x > COLORIZATION_THRESHOLD { 0.01 } else { 1.0 }) * boost)
         .collect();
 
     // We could adjust the weights such that streams with higher colorization rates are

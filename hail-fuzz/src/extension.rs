@@ -332,6 +332,14 @@ impl FuzzerStage for MultiStreamExtendStage {
                                 candidates.len(), candidates
                             );
                             fuzzer.relation_graph.add_structural_candidates(target_ctx, &candidates);
+
+                            // Optional: dump the live relation graph for offline evaluation.
+                            if std::env::var_os("DUMP_RELATIONS").is_some() {
+                                let _ = std::fs::write(
+                                    fuzzer.workdir.join("relations.json"),
+                                    fuzzer.relation_graph.to_json(),
+                                );
+                            }
                         }
                     }
                 };
