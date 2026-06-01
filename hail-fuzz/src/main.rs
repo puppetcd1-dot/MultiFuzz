@@ -620,6 +620,14 @@ impl Fuzzer {
             MmioFlowAnalyzer::new(mmio_ranges)
         };
 
+        // Ablation control: `DISABLE_RELATION_ASSIST` keeps Phase A extraction (graph still
+        // built and dumped) but removes the mutation-weight bias — the "extraction only" arm.
+        let mut relation_graph = StreamRelationGraph::new();
+        if std::env::var_os("DISABLE_RELATION_ASSIST").is_some() {
+            relation_graph.set_assist_enabled(false);
+            tracing::info!("DISABLE_RELATION_ASSIST set — relation graph extracted but not used for mutation");
+        }
+
         let mut global_dict = Dictionary::default();
         if let Some(dict_path) = std::env::var_os("DICTIONARY") {
             let input = std::fs::read_to_string(&dict_path).with_context(|| {
@@ -663,7 +671,7 @@ impl Fuzzer {
             re_prioritization_inputs: 0,
             features,
             debug: DebugSettings::from_env()?,
-            relation_graph: StreamRelationGraph::new(),
+            relation_graph,
             mmio_flow,
         })
     }

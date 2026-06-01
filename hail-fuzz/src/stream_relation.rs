@@ -130,11 +130,19 @@ pub struct StreamRelationGraph {
     pub edges:    Vec<StreamEdge>,
     outgoing: HashMap<StreamKey, Vec<usize>>,
     incoming: HashMap<StreamKey, Vec<usize>>,
+    /// When false, `mutation_weight_factor` always returns 1.0 so the graph is still
+    /// extracted and dumped but provides no mutation bias (ablation Arm B).
+    assist_enabled: bool,
 }
 
 impl StreamRelationGraph {
     pub fn new() -> Self {
-        Self::default()
+        Self { assist_enabled: true, ..Default::default() }
+    }
+
+    /// Enable/disable the mutation-assistance bias at runtime (extraction is unaffected).
+    pub fn set_assist_enabled(&mut self, enabled: bool) {
+        self.assist_enabled = enabled;
     }
 
     /// Add structurally-inferred candidate edges (Phase A output).
@@ -235,6 +243,9 @@ impl StreamRelationGraph {
     /// at several sites) and get a smaller boost.  A `TaintConfirmed` edge is weighted above
     /// a merely `Structural` one.
     pub fn mutation_weight_factor(&self, addr: StreamKey) -> f64 {
+        if !self.assist_enabled {
+            return 1.0;
+        }
         let mut factor = 1.0_f64;
         for list in [self.incoming.get(&addr), self.outgoing.get(&addr)].into_iter().flatten() {
             for &idx in list {
