@@ -322,10 +322,21 @@ impl FuzzerStage for MultiStreamExtendStage {
                     if new_mmio_addr {
                         let readwatch_pc = fuzzer.vm.cpu.read_pc();
                         let target_ctx = AccessContext::new(readwatch_pc, addr);
-                        // Record this MMIO read site (pc → stream addr) so the structural slice
-                        // can recognise register-indirect MMIO loads at this PC as sources of
-                        // future streams.
-                        fuzzer.mmio_flow.record_read_site(readwatch_pc, addr);
+                        // Pull in *every* MMIO read site (pc → stream key) observed during this
+                        // execution from the MMIO handler — not just streams that exhausted into a
+                        // ReadWatch.  This lets the backward slice recognise register-indirect MMIO
+                        // loads of any prior stream (including streams that never exhausted) as the
+                        // sources that govern this newly detected stream.  Collected into a temp so
+                        // the handler borrow (of `self.vm`) is released before touching
+                        // `fuzzer.mmio_flow`.
+                        let sites: Vec<(u64, StreamKey)> = fuzzer
+                            .target
+                            .get_mmio_handler(&mut fuzzer.vm)
+                            .map(|h| h.read_sites.iter().map(|(&pc, &key)| (pc, key)).collect())
+                            .unwrap_or_default();
+                        for (pc, key) in sites {
+                            fuzzer.mmio_flow.record_read_site(pc, key);
+                        }
                         let candidates = fuzzer
                             .mmio_flow
                             .candidates_for_new_stream(readwatch_pc, &fuzzer.vm.code);

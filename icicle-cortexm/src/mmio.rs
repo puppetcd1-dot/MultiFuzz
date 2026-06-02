@@ -56,6 +56,12 @@ pub struct FuzzwareMmioHandler<I> {
     pub passthrough: Vec<u32>,
     access_contexts: bool,
     uc_ptr: *mut crate::uc_engine,
+    /// Observed MMIO read sites: instruction PC → stream key.  Captures *every* MMIO read
+    /// (not just stream-exhaustion ReadWatch events), so the structural dependency slice can
+    /// recognise register-indirect MMIO loads (`ldr rN,[rM]`) at these PCs as the sources that
+    /// govern later streams.  Accumulated across the whole campaign; bounded by the number of
+    /// distinct load PCs in the firmware.
+    pub read_sites: std::collections::HashMap<u64, u64>,
 }
 
 impl<I> std::ops::DerefMut for FuzzwareMmioHandler<I> {
@@ -96,7 +102,14 @@ impl<I> FuzzwareMmioHandler<I> {
         source: I,
     ) -> Self {
         let (models, passthrough) = build_models(models);
-        Self { source, models, passthrough, uc_ptr, access_contexts }
+        Self {
+            source,
+            models,
+            passthrough,
+            uc_ptr,
+            access_contexts,
+            read_sites: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -122,6 +135,13 @@ impl<I: IoMemory> IoMemory for FuzzwareMmioHandler<I> {
         };
 
         let key = if self.access_contexts { ((pc as u64) << 32) | addr } else { addr };
+
+        // Record the (load PC → stream key) for *every* MMIO read.  This lets the structural
+        // dependency analysis attribute register-indirect MMIO loads at this PC even for streams
+        // that never exhaust (never trigger a ReadWatch) and so would otherwise be invisible as
+        // governing sources.
+        self.read_sites.insert(pc as u64, key);
+
         if self.models.is_empty() {
             // Avoid doing any extra work if models are not enabled.
             return self.source.read(key, buf);
