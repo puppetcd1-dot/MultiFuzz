@@ -465,3 +465,136 @@ fn seed_demand_from_block(block: &Block, pc: u64) -> DemandSlice {
         None => DemandSlice::default(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use icicle_vm::cpu::lifter::{Block, BlockExit};
+    use pcode::VarNode;
+
+    /// Wrap a hand-built `pcode::Block` in a lifter `Block` spanning `[start, end)`.
+    fn lifter_block(pcode: pcode::Block, start: u64, end: u64) -> Block {
+        Block {
+            pcode,
+            entry: None,
+            start,
+            end,
+            context: 0,
+            exit: BlockExit::invalid(),
+            breakpoints: 0,
+            num_instructions: 0,
+        }
+    }
+
+    fn marker(pc: u64) -> pcode::Instruction {
+        (pcode::Op::InstructionMarker, pcode::Value::Const(pc, 8)).into()
+    }
+
+    /// A general-purpose register varnode (positive id ⇒ survives across blocks).
+    fn reg(id: pcode::VarId) -> VarNode {
+        VarNode::new(id, 4)
+    }
+
+    /// Regression test for the literal-pool false positive (PR feedback, Edge 1/Edge 2).
+    ///
+    /// A non-MMIO load (e.g. `LDR R2, =const` — a flash literal-pool read) must terminate the
+    /// dependency chain: tracing its address operand would otherwise pull unrelated MMIO reads
+    /// into the slice and emit spurious `Address` edges.  Here the literal-pool pointer is
+    /// (contrivedly) derived from an MMIO value so that, *without* the fix, the backward slice
+    /// would walk through the non-MMIO load and wrongly record the MMIO read as an Address source.
+    #[test]
+    fn non_mmio_load_terminates_address_chain() {
+        let mut pcode = pcode::Block::new();
+        let mmio_out = reg(10); // value read from the status register
+        let lit_ptr = reg(6); // pointer used by the literal-pool load
+        let r2 = reg(2); // result of the literal-pool load
+        let tgt_addr = reg(7); // B's computed address (the seed)
+
+        pcode.push(marker(0x100));
+        pcode.push((mmio_out, pcode::Op::Load(0), reg(5))); // MMIO load @0x100
+        pcode.push(marker(0x104));
+        pcode.push((lit_ptr, pcode::Op::Copy, mmio_out));
+        pcode.push((r2, pcode::Op::Load(0), lit_ptr)); // NON-MMIO load @0x104
+        pcode.push(marker(0x108));
+        pcode.push((tgt_addr, pcode::Op::IntAdd, r2, pcode::Value::Const(0x90, 4)));
+
+        let block = lifter_block(pcode, 0x100, 0x10c);
+
+        // Only the MMIO load @0x100 is a known read site; @0x104 (literal pool) is not.
+        let mut read_sites: HashMap<u64, StreamKey> = HashMap::new();
+        read_sites.insert(0x100, 0x5801_0008);
+
+        let mut slice = DemandSlice::seed(tgt_addr);
+        slice.process_block_backward(&block, &[], &read_sites, false);
+
+        // With the fix the chain stops at the non-MMIO load: no spurious Address source.
+        assert!(
+            slice.sources_addr.is_empty(),
+            "non-MMIO load should not leak an Address source, got {:?}",
+            slice.sources_addr
+        );
+    }
+
+    /// Genuine indexed-MMIO addressing must still be captured: when B's address is computed
+    /// directly from a value read at a known MMIO site, that site is a real `Address` source.
+    #[test]
+    fn indexed_mmio_address_is_captured() {
+        let mut pcode = pcode::Block::new();
+        let idx = reg(10);
+        let tgt_addr = reg(7);
+
+        pcode.push(marker(0x200));
+        pcode.push((idx, pcode::Op::Load(0), reg(5))); // MMIO load @0x200
+        pcode.push(marker(0x204));
+        pcode.push((tgt_addr, pcode::Op::IntAdd, reg(4), idx)); // B addr = base + mmio idx
+
+        let block = lifter_block(pcode, 0x200, 0x208);
+
+        let mut read_sites: HashMap<u64, StreamKey> = HashMap::new();
+        read_sites.insert(0x200, 0x5800_0000);
+
+        let mut slice = DemandSlice::seed(tgt_addr);
+        slice.process_block_backward(&block, &[], &read_sites, false);
+
+        assert!(
+            slice.sources_addr.contains(&AccessContext::new(0x200, 0x5800_0000)),
+            "indexed MMIO address dependency must be captured, got {:?}",
+            slice.sources_addr
+        );
+    }
+
+    /// The address operand of a *genuine* MMIO load is still traced, so a deeper indexed-MMIO
+    /// chain (pointer of one MMIO read computed from another MMIO read) yields both sources.
+    #[test]
+    fn mmio_load_still_traces_its_pointer() {
+        let mut pcode = pcode::Block::new();
+        let off = reg(10);
+        let ptr = reg(6);
+        let val = reg(2);
+        let tgt = reg(7);
+
+        pcode.push(marker(0x300));
+        pcode.push((off, pcode::Op::Load(0), reg(5))); // MMIO load @0x300 (offset)
+        pcode.push(marker(0x304));
+        pcode.push((ptr, pcode::Op::IntAdd, reg(4), off));
+        pcode.push((val, pcode::Op::Load(0), ptr)); // MMIO load @0x304 (value), addr is MMIO-derived
+        pcode.push(marker(0x308));
+        pcode.push((tgt, pcode::Op::Copy, val));
+
+        let block = lifter_block(pcode, 0x300, 0x30c);
+
+        let mut read_sites: HashMap<u64, StreamKey> = HashMap::new();
+        read_sites.insert(0x300, 0xAAAA);
+        read_sites.insert(0x304, 0xBBBB);
+
+        let mut slice = DemandSlice::seed(tgt);
+        slice.process_block_backward(&block, &[], &read_sites, false);
+
+        assert!(
+            slice.sources_addr.contains(&AccessContext::new(0x304, 0xBBBB))
+                && slice.sources_addr.contains(&AccessContext::new(0x300, 0xAAAA)),
+            "deep indexed-MMIO chain should yield both MMIO sources, got {:?}",
+            slice.sources_addr
+        );
+    }
+}
