@@ -7,7 +7,10 @@ use icicle_vm::{
 };
 use pcode::{Op, Value, VarId};
 
-use crate::stream_relation::{AccessContext, EdgeKind};
+use crate::{
+    input::StreamKey,
+    stream_relation::{AccessContext, EdgeKind},
+};
 
 /// Traversal depth when crossing function call boundaries.
 const MAX_CALL_LEVELS: usize = 3;
@@ -77,6 +80,7 @@ impl DemandSlice {
         &mut self,
         block: &Block,
         mmio_ranges: &[Range<u64>],
+        read_sites: &HashMap<u64, StreamKey>,
         inject_control: bool,
     ) {
         // Forward pass to map (instruction_index → current_pc) for source contexts.
@@ -109,11 +113,27 @@ impl DemandSlice {
 
             match stmt.op {
                 Op::Load(_) => {
+                    let load_pc = stmt_pcs[idx];
+                    // Register-indirect MMIO reads (`ldr r0,[rN]`) lift to a Load with a *Var*
+                    // address — the lifter never folds the literal-pool base into a constant
+                    // (Op::Load is opaque to const-propagation).  So recognise MMIO loads by
+                    // the runtime-observed (pc → stream address) map, which captures the PC of
+                    // every MMIO read site that has triggered a ReadWatch.
+                    if let Some(&saddr) = read_sites.get(&load_pc) {
+                        let ctx = AccessContext::new(load_pc, saddr);
+                        if in_data {
+                            self.sources_addr.insert(ctx);
+                        }
+                        if in_ctrl {
+                            self.sources_ctrl.insert(ctx);
+                        }
+                    }
                     match stmt.inputs.first() {
                         Value::Const(addr, _) => {
+                            // Complementary path: absolute-addressed MMIO (rare; e.g. some PPB
+                            // accesses) where the address survives as a constant.
                             if mmio_ranges.iter().any(|r| r.contains(&addr)) {
-                                // MMIO source: tag it on the channel(s) that demanded it.
-                                let ctx = AccessContext::new(stmt_pcs[idx], addr);
+                                let ctx = AccessContext::new(load_pc, addr);
                                 if in_data {
                                     self.sources_addr.insert(ctx);
                                 }
@@ -121,12 +141,10 @@ impl DemandSlice {
                                     self.sources_ctrl.insert(ctx);
                                 }
                             }
-                            // Non-MMIO const load (e.g. literal pool / RAM): nothing more to
-                            // demand structurally — value provenance would require memory
-                            // modelling (left to Phase B taint).
                         }
                         Value::Var(addr_var) if !addr_var.is_invalid() => {
-                            // Dynamic address: trace how the pointer was computed.
+                            // Dynamic address: also trace how the pointer was computed (it may
+                            // be an indexed access whose offset is itself MMIO-derived).
                             ins.push(addr_var.id);
                         }
                         _ => {}
@@ -297,11 +315,14 @@ pub struct MmioFlowAnalyzer {
     pub mmio_ranges: Vec<Range<u64>>,
     /// Maximum number of function-call boundaries to cross when walking backward.
     pub max_call_levels: usize,
+    /// Runtime-observed MMIO read sites: instruction PC → stream address.  Populated at each
+    /// ReadWatch so the structural slice can recognise register-indirect MMIO loads.
+    pub mmio_read_sites: HashMap<u64, StreamKey>,
 }
 
 impl MmioFlowAnalyzer {
     pub fn new(mmio_ranges: Vec<Range<u64>>) -> Self {
-        Self { mmio_ranges, max_call_levels: MAX_CALL_LEVELS }
+        Self { mmio_ranges, max_call_levels: MAX_CALL_LEVELS, mmio_read_sites: HashMap::new() }
     }
 
     /// Standard ARM Cortex-M MMIO range (covers peripheral bus + private peripherals).
@@ -310,6 +331,12 @@ impl MmioFlowAnalyzer {
             0x4000_0000..0x6000_0000, // APB/AHB peripherals
             0xE000_0000..0xF000_0000, // Private peripheral bus (NVIC, SysTick, etc.)
         ])
+    }
+
+    /// Record an observed MMIO read site (called at each ReadWatch).  This is what lets the
+    /// backward slice identify register-indirect MMIO loads as dependency sources.
+    pub fn record_read_site(&mut self, pc: u64, addr: StreamKey) {
+        self.mmio_read_sites.insert(pc, addr);
     }
 
     /// Find all MMIO access contexts that structurally govern the access to a new stream B at
@@ -374,7 +401,12 @@ impl MmioFlowAnalyzer {
             let inject_control = addr != start_addr;
 
             let before = (slice.demand_count(), slice.source_count());
-            slice.process_block_backward(block, &self.mmio_ranges, inject_control);
+            slice.process_block_backward(
+                block,
+                &self.mmio_ranges,
+                &self.mmio_read_sites,
+                inject_control,
+            );
             slice.strip_temporaries();
             let after = (slice.demand_count(), slice.source_count());
 

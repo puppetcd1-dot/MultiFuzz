@@ -322,6 +322,10 @@ impl FuzzerStage for MultiStreamExtendStage {
                     if new_mmio_addr {
                         let readwatch_pc = fuzzer.vm.cpu.read_pc();
                         let target_ctx = AccessContext::new(readwatch_pc, addr);
+                        // Record this MMIO read site (pc → stream addr) so the structural slice
+                        // can recognise register-indirect MMIO loads at this PC as sources of
+                        // future streams.
+                        fuzzer.mmio_flow.record_read_site(readwatch_pc, addr);
                         let candidates = fuzzer
                             .mmio_flow
                             .candidates_for_new_stream(readwatch_pc, &fuzzer.vm.code);
