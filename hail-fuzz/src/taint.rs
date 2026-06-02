@@ -127,7 +127,12 @@ impl TaintTag {
         match self {
             TaintTag::Clean => TagIter::Clean,
             TaintTag::Inline(bits) => TagIter::Inline(*bits & !OVERFLOW_BIT),
-            TaintTag::Chunked(chunks) => TagIter::Chunked { chunks, chunk: 0, bits: 0 },
+            TaintTag::Chunked(chunks) => {
+                // Seed `bits` with chunk 0; the iterator advances to later chunks as each is
+                // exhausted.  (Seeding with 0 here would make the first `next()` skip chunk 0
+                // entirely, dropping streams 0–63.)
+                TagIter::Chunked { chunks, chunk: 0, bits: chunks.first().copied().unwrap_or(0) }
+            }
         }
     }
 }
@@ -281,6 +286,12 @@ impl ShadowState {
         }
     }
 
+    /// Public accessor for the source tag of an access context (used by the Phase B engine
+    /// when an MMIO read is observed and its loaded value must be tagged onto a register).
+    pub fn source_tag(&mut self, ctx: AccessContext) -> TaintTag {
+        self.tag_for_context(ctx)
+    }
+
     // ── Shadow register access ──────────────────────────────────────────────
 
     pub fn reg_tag(&self, var_id: i16) -> TaintTag {
@@ -413,4 +424,98 @@ impl ShadowState {
 
 impl Default for ShadowState {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(pc: u64) -> AccessContext {
+        AccessContext::new(pc, 0x5800_0000 + pc)
+    }
+
+    /// Inline → Chunked promotion preserves every previously-set stream bit (no loss at 64th).
+    #[test]
+    fn tag_promotes_inline_to_chunked_without_loss() {
+        let mut tag = TaintTag::Clean;
+        // Set bits across the inline boundary (INLINE_CAPACITY = 62) into chunked territory.
+        for i in [0usize, 5, 61, 62, 70, 130] {
+            tag.set_stream(i);
+        }
+        let got: std::collections::BTreeSet<usize> = tag.iter_streams().collect();
+        let want: std::collections::BTreeSet<usize> = [0, 5, 61, 62, 70, 130].into_iter().collect();
+        assert_eq!(got, want, "promotion to Chunked must preserve all bits");
+        assert!(matches!(tag, TaintTag::Chunked(_)));
+    }
+
+    /// Union across the Inline/Chunked representation boundary is correct.
+    #[test]
+    fn tag_union_mixed_representations() {
+        let mut a = TaintTag::Clean; // stays inline
+        a.set_stream(3);
+        a.set_stream(10);
+        let mut b = TaintTag::Clean; // forced chunked
+        b.set_stream(10);
+        b.set_stream(100);
+
+        let u = a.union(&b);
+        let got: std::collections::BTreeSet<usize> = u.iter_streams().collect();
+        assert_eq!(got, [3usize, 10, 100].into_iter().collect());
+        assert!(a.overlaps(&b), "shared bit 10 must register as overlap");
+    }
+
+    /// The StreamIndex sets the overflow sentinel past capacity rather than silently dropping.
+    #[test]
+    fn index_overflow_sets_sentinel_no_panic() {
+        let mut shadow = ShadowState { index: StreamIndex::new(2), ..ShadowState::new() };
+        // Two contexts fit; the third overflows.
+        shadow.taint_mmio_read(ctx(0x10), 0x2000_0000, 4);
+        shadow.taint_mmio_read(ctx(0x20), 0x2000_0100, 4);
+        shadow.taint_mmio_read(ctx(0x30), 0x2000_0200, 4); // overflow
+
+        // The overflowed read carries the sentinel, attribution is flagged uncertain.
+        assert!(shadow.mem_tag(0x2000_0200).has_overflow());
+        // The first two remain precisely attributable.
+        let attributed = shadow.tainted_contexts_in_mem(0x2000_0000, 4);
+        assert_eq!(attributed, vec![ctx(0x10)]);
+    }
+
+    /// `memcpy` summary copies source taint to the destination range; r0 ends clean.
+    #[test]
+    fn memcpy_summary_propagates_range_taint() {
+        let mut shadow = ShadowState::new();
+        shadow.taint_mmio_read(ctx(0x40), 0x2000_0000, 4); // tainted src bytes
+
+        shadow.set_reg_tag(0, shadow.mem_tag(0x2000_0000)); // pretend r0 had src taint
+        shadow.summary_memcpy(0x2000_1000, 0x2000_0000, 4);
+
+        // Destination now carries the source's taint.
+        assert_eq!(shadow.tainted_contexts_in_mem(0x2000_1000, 4), vec![ctx(0x40)]);
+        // Return register (r0 = dst pointer) is untainted by the copy itself.
+        assert!(shadow.reg_tag(0).is_clean());
+    }
+
+    /// An opaque CALL kills r0–r3 taint (plan Fix 4: kill over union).
+    #[test]
+    fn call_kill_clears_arg_registers() {
+        let mut shadow = ShadowState::new();
+        for r in 0..4i16 {
+            shadow.set_reg_tag(r, {
+                let mut t = TaintTag::Clean;
+                t.set_stream(r as usize);
+                t
+            });
+        }
+        shadow.set_reg_tag(7, {
+            let mut t = TaintTag::Clean;
+            t.set_stream(7);
+            t
+        });
+        shadow.kill_call_regs();
+        for r in 0..4i16 {
+            assert!(shadow.reg_tag(r).is_clean(), "r{r} must be killed by the call");
+        }
+        // Callee-saved register outside r0–r3 is preserved.
+        assert!(!shadow.reg_tag(7).is_clean(), "r7 must survive the call");
+    }
 }

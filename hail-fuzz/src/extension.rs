@@ -284,6 +284,7 @@ impl FuzzerStage for MultiStreamExtendStage {
             };
 
             let mut new_mmio_addr = false;
+            let mut do_phase_b = false;
             if matches!(exit, VmExit::UnhandledException((ExceptionCode::ReadWatch, _))) {
                 // If the mutated input ends at a new location then consider saving it, for a second
                 // multi-stream extension stage.
@@ -348,12 +349,30 @@ impl FuzzerStage for MultiStreamExtendStage {
                             );
                             fuzzer.relation_graph.add_structural_candidates(target_ctx, &candidates);
 
-                            // Optional: dump the live relation graph for offline evaluation.
+                            // Dump the live relation graph for offline evaluation.  When Phase B
+                            // is sampled this iteration, it is re-dumped after the pass below so
+                            // the file reflects the taint-confirmed/classified edges too.
                             if std::env::var_os("DUMP_RELATIONS").is_some() {
                                 let _ = std::fs::write(
                                     fuzzer.workdir.join("relations.json"),
                                     fuzzer.relation_graph.to_json(),
                                 );
+                            }
+                        }
+
+                        // Phase B: decide whether to run a (seed-re-executing) dynamic taint pass.
+                        // Only when `PHASE_B` is set, and sampled (default ≈5%, 1-in-20 new-stream
+                        // events; override with PHASE_B_RATE).  The pass itself runs at the END of
+                        // this loop iteration so it cannot corrupt `fuzzer.state` mid-iteration.
+                        if fuzzer.phase_b.is_some() {
+                            let rate: u64 = std::env::var("PHASE_B_RATE")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .filter(|&r| r > 0)
+                                .unwrap_or(20);
+                            fuzzer.phase_b_counter += 1;
+                            if fuzzer.phase_b_counter % rate == 0 {
+                                do_phase_b = true;
                             }
                         }
                     }
@@ -374,6 +393,19 @@ impl FuzzerStage for MultiStreamExtendStage {
 
             save_metadata(fuzzer, &state);
             fuzzer.update_stats(stats);
+
+            // Phase B taint pass runs here, at the end of the iteration: it re-executes the seed
+            // and overwrites `fuzzer.state`/VM state, but the next `exec_one` restores the prefix
+            // snapshot and re-clones the current input, so the stage state machine recovers.
+            if do_phase_b {
+                fuzzer.run_phase_b_pass();
+                if std::env::var_os("DUMP_RELATIONS").is_some() {
+                    let _ = std::fs::write(
+                        fuzzer.workdir.join("relations.json"),
+                        fuzzer.relation_graph.to_json(),
+                    );
+                }
+            }
         }
     }
 }

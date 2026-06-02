@@ -12,6 +12,7 @@ mod mmio_flow;
 mod monitor;
 mod mutations;
 mod p2im_unit_tests;
+mod phase_b;
 mod queue;
 mod stream_relation;
 mod taint;
@@ -539,6 +540,13 @@ pub(crate) struct Fuzzer {
     pub relation_graph: StreamRelationGraph,
     /// Phase A: structural MMIO dependency analyzer (P-code backward demand slice).
     pub mmio_flow: MmioFlowAnalyzer,
+    /// Phase B: dynamic taint state (block cache + engine), installed only when the
+    /// `PHASE_B` env var is set.  `None` disables Phase B entirely.
+    pub phase_b: Option<std::rc::Rc<std::cell::RefCell<phase_b::PhaseBState>>>,
+    /// Cross-pass `(value_A, count_B)` samples used to fit `Length` edge relations.
+    pub length_store: phase_b::LengthSampleStore,
+    /// Counter used to sample which new-stream events trigger a Phase B taint pass.
+    pub phase_b_counter: u64,
 }
 
 impl Fuzzer {
@@ -628,6 +636,18 @@ impl Fuzzer {
             tracing::info!("DISABLE_RELATION_ASSIST set — relation graph extracted but not used for mutation");
         }
 
+        // Phase B: install the dynamic-taint block cache + hook when enabled.  Installed here
+        // (after the boot run) so only blocks lifted during fuzzing are instrumented — the
+        // small boot-path prefix is intentionally uninstrumented (it precedes the first MMIO
+        // read, so it has no taint sources).
+        let phase_b = if std::env::var_os("PHASE_B").is_some() {
+            let ranges = mmio_flow.mmio_ranges.clone();
+            tracing::info!("PHASE_B enabled — installing dynamic taint instrumentation");
+            Some(phase_b::install(&mut vm, ranges))
+        } else {
+            None
+        };
+
         let mut global_dict = Dictionary::default();
         if let Some(dict_path) = std::env::var_os("DICTIONARY") {
             let input = std::fs::read_to_string(&dict_path).with_context(|| {
@@ -673,6 +693,9 @@ impl Fuzzer {
             debug: DebugSettings::from_env()?,
             relation_graph,
             mmio_flow,
+            phase_b,
+            length_store: phase_b::LengthSampleStore::new(),
+            phase_b_counter: 0,
         })
     }
 
@@ -689,6 +712,52 @@ impl Fuzzer {
     /// Runs the VM until it exits and updates the current fuzzing state.
     pub fn execute(&mut self) -> Option<VmExit> {
         self.execute_with_limit(self.config.icount_limit)
+    }
+
+    /// Phase B: run one dynamic-taint pass over the *current* input and merge the
+    /// confirmed/classified edges into the relation graph.
+    ///
+    /// Re-executes the current input from the initial snapshot with the taint engine armed.
+    /// The caller is responsible for re-establishing any stage state afterwards (the extension
+    /// stage does so by restoring its prefix snapshot on the next `exec_one`).  No-op unless
+    /// Phase B was installed (`PHASE_B` env var).
+    pub fn run_phase_b_pass(&mut self) {
+        let Some(state) = self.phase_b.clone() else {
+            return;
+        };
+
+        let read_sites = self.mmio_flow.mmio_read_sites.clone();
+        let ranges = self.mmio_flow.mmio_ranges.clone();
+        {
+            let mut st = state.borrow_mut();
+            st.reset_pass(read_sites, ranges);
+            st.set_armed(true);
+        }
+
+        Snapshot::restore_initial(self);
+        self.state.input.seek_to_start();
+        if self.write_input_to_target().is_ok() {
+            let _ = self.execute();
+        }
+
+        let result = {
+            let mut st = state.borrow_mut();
+            st.set_armed(false);
+            st.finish_pass()
+        };
+
+        let before = self.relation_graph.edge_count();
+        phase_b::apply_pass_result(
+            &mut self.relation_graph,
+            &mut self.length_store,
+            result,
+        );
+        tracing::debug!(
+            "Phase B pass complete: {} edges in graph ({} confirmed)",
+            self.relation_graph.edge_count(),
+            self.relation_graph.confirmed_edges().count(),
+        );
+        let _ = before;
     }
 
     /// Runs the VM until it exits or executs `limit` number of instructions and update the current
