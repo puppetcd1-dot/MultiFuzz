@@ -5,7 +5,7 @@ use icicle_vm::{
     cpu::lifter::{Block, BlockExit, Target},
     BlockTable,
 };
-use pcode::{Op, Value, VarId};
+use pcode::{Op, Value, VarId, VarNode};
 
 use crate::{
     input::StreamKey,
@@ -93,6 +93,24 @@ impl DemandSlice {
                     pc = stmt.inputs.first().as_u64();
                 }
                 stmt_pcs[i] = pc;
+            }
+        }
+
+        // Control-dependence: a predecessor block's branch condition gates the path to B.
+        // This MUST be injected *before* the backward pass: the condition is computed inside
+        // *this* block (an ARM CMP/TST sets it just before the conditional branch), so the
+        // backward pass — which runs end→start — needs the condition already in demanded_ctrl
+        // to trace it back to the MMIO read(s) that feed it.  Injecting it *after* the pass
+        // (as before) was a no-op: the pass had already finished, and strip_temporaries() then
+        // deleted the condition (a negative-id temporary) before any predecessor could use it,
+        // so the control channel never activated and no Control edges were ever produced.
+        if inject_control {
+            if let Some(cond) = block.exit.cond() {
+                if let Value::Var(var) = cond {
+                    if !var.is_invalid() {
+                        self.demanded_ctrl.insert(var.id);
+                    }
+                }
             }
         }
 
@@ -251,16 +269,6 @@ impl DemandSlice {
             }
         }
 
-        // Control-dependence: a predecessor block's branch condition gates the path to B.
-        if inject_control {
-            if let Some(cond) = block.exit.cond() {
-                if let Value::Var(var) = cond {
-                    if !var.is_invalid() {
-                        self.demanded_ctrl.insert(var.id);
-                    }
-                }
-            }
-        }
     }
 
     /// Strip temporaries from both demand channels.  Called when carrying demands across
@@ -516,32 +524,99 @@ impl MmioFlowAnalyzer {
     }
 }
 
-/// Seed the demand slice from the LOAD instruction at (or immediately before) `pc`
-/// inside `block`.  The LOAD's address input varnode is added to the demand set.
+/// Seed the demand slice from the LOAD instruction at exactly `pc` inside `block`.
+///
+/// For indexed loads like `LDR R0,[R4,#4]` the lifter emits:
+///   `$tmp = INT_ADD(R4, 4);  R0 = LOAD($tmp)`
+/// The address input of the LOAD is `$tmp` (a negative-id temporary).  Because
+/// temporaries don't survive block boundaries they would be stripped immediately,
+/// leaving an empty seed.  `resolve_temporary_in_block` chases the temporary back
+/// through `Copy`/`IntAdd` chains to the underlying named register (R4 here).
 fn seed_demand_from_block(block: &Block, pc: u64) -> DemandSlice {
     let mut current_pc = block.start;
-    let mut candidate: Option<pcode::VarNode> = None;
+    let mut target_idx: Option<usize> = None;
 
-    for stmt in &block.pcode.instructions {
+    for (i, stmt) in block.pcode.instructions.iter().enumerate() {
         if stmt.op == Op::InstructionMarker {
             current_pc = stmt.inputs.first().as_u64();
         }
-        // Collect LOAD address varnodes for instructions up to and including `pc`.
-        if current_pc <= pc {
+        if current_pc == pc {
             if let Op::Load(_) = stmt.op {
-                if let Value::Var(addr_var) = stmt.inputs.first() {
-                    if !addr_var.is_invalid() {
-                        candidate = Some(addr_var);
-                    }
-                }
+                target_idx = Some(i);
+                break;
             }
         }
     }
 
-    match candidate {
-        Some(vn) => DemandSlice::seed(vn),
-        None => DemandSlice::default(),
+    let idx = match target_idx {
+        Some(i) => i,
+        None => return DemandSlice::default(),
+    };
+
+    let load_stmt = &block.pcode.instructions[idx];
+    let addr_var = match load_stmt.inputs.first() {
+        Value::Var(vn) if !vn.is_invalid() => vn,
+        _ => return DemandSlice::default(),
+    };
+
+    let final_var = resolve_temporary_in_block(block, idx, addr_var.id);
+    if final_var.is_invalid() { DemandSlice::default() } else { DemandSlice::seed(final_var) }
+}
+
+/// Chase a varnode id backward through `Copy` and `IntAdd` chains within `block`,
+/// looking only at instructions before `up_to_idx`, and return the first
+/// non-temporary (`id >= 0`) varnode reached.
+///
+/// Returns `VarNode::NONE` (id == 0, treated as invalid) when resolution fails.
+fn resolve_temporary_in_block(block: &Block, up_to_idx: usize, tmp_id: VarId) -> VarNode {
+    if tmp_id > 0 {
+        // Named register (positive id) — already resolved.
+        return VarNode::new(tmp_id, 4);
     }
+    if tmp_id == 0 {
+        // id == 0 is the invalid sentinel.
+        return VarNode::NONE;
+    }
+    // tmp_id < 0: search backward for the defining instruction.
+    for stmt in block.pcode.instructions[..up_to_idx].iter().rev() {
+        let out = stmt.output;
+        if out.is_invalid() || out.id != tmp_id {
+            continue;
+        }
+        return match stmt.op {
+            Op::Copy | Op::ZeroExtend | Op::SignExtend => {
+                match stmt.inputs.first() {
+                    Value::Var(src) if !src.is_invalid() => {
+                        resolve_temporary_in_block(block, up_to_idx, src.id)
+                    }
+                    _ => VarNode::NONE,
+                }
+            }
+            Op::IntAdd | Op::IntSub => {
+                // For `base_reg + immediate_offset` (common ARM indexed load), the first
+                // operand is the base register.  We return the first non-temporary input
+                // found; if both inputs are temporaries we recurse on the first one.
+                let src0 = stmt.inputs.first();
+                let src1 = stmt.inputs.second();
+                for src in [src0, src1] {
+                    if let Value::Var(vn) = src {
+                        if vn.id > 0 {
+                            return vn; // Named register — done.
+                        }
+                        if vn.id < 0 {
+                            let rec = resolve_temporary_in_block(block, up_to_idx, vn.id);
+                            if !rec.is_invalid() {
+                                return rec;
+                            }
+                        }
+                    }
+                }
+                VarNode::NONE
+            }
+            _ => VarNode::NONE,
+        };
+    }
+    VarNode::NONE
 }
 
 #[cfg(test)]
@@ -773,6 +848,79 @@ mod tests {
         assert!(
             slice_nocut.sources_addr.contains(&AccessContext::new(0x108, 0x5801_0008)),
             "without cutoff the post-B redefinition is (wrongly) recorded — guards the fix"
+        );
+    }
+
+    /// `seed_demand_from_block` must resolve through the temporary produced by `INT_ADD`
+    /// for an indexed load (`LDR R0,[R4,#4]`) and seed the base register (R4), not the
+    /// short-lived temporary.  Seeding the temporary would leave `demanded_data = {-n}`
+    /// which `strip_temporaries` erases before any predecessor block is visited.
+    #[test]
+    fn seed_resolves_indexed_load_temporary_to_base_register() {
+        let mut pcode = pcode::Block::new();
+        let tmp = VarNode::new(-1, 4); // $tmp produced by INT_ADD
+        let r4 = VarNode::new(4, 4);   // base register R4
+        let r0 = VarNode::new(1, 4);   // destination
+
+        // LDR R0,[R4,#4] lifts as: $tmp = INT_ADD(R4, 4); R0 = LOAD($tmp)
+        pcode.push(marker(0x500));
+        pcode.push((tmp, pcode::Op::IntAdd, r4, pcode::Value::Const(4, 4)));
+        pcode.push((r0, pcode::Op::Load(0), tmp));
+
+        let block = lifter_block(pcode, 0x500, 0x504);
+
+        let slice = seed_demand_from_block(&block, 0x500);
+
+        assert!(
+            slice.demanded_data.contains(&r4.id),
+            "seed should demand the base register R4 (id=4), got {:?}",
+            slice.demanded_data
+        );
+        assert!(
+            !slice.demanded_data.contains(&tmp.id),
+            "seed must not demand the short-lived temporary (id=-1)"
+        );
+    }
+
+    /// When a predecessor block's branch condition is gated on an MMIO read, the
+    /// backward pass must produce a `Control` edge to that stream.  This verifies the
+    /// inject_control-before-pass fix: the branch condition must be in `demanded_ctrl`
+    /// *before* the backward pass runs so it can be traced back to the MMIO load.
+    #[test]
+    fn control_injection_before_pass_yields_control_edge() {
+        // Predecessor block:
+        //   0x600: R1 = LOAD[mmio_ctrl]         ; MMIO read feeds the branch condition
+        //   0x604: $tmp = INT_EQUAL(R1, #3)     ; compare
+        //   exit:  CBRANCH($tmp, <target>)       ; conditional branch gating path to B
+        let mut pcode = pcode::Block::new();
+        let r1 = VarNode::new(1, 4);
+        let tmp_cmp = VarNode::new(-2, 1);
+        let mmio_base = VarNode::new(9, 4); // address register for mmio_ctrl
+
+        pcode.push(marker(0x600));
+        pcode.push((r1, pcode::Op::Load(0), mmio_base));
+        pcode.push(marker(0x604));
+        pcode.push((tmp_cmp, pcode::Op::IntEqual, r1, pcode::Value::Const(3, 4)));
+
+        let mut block = lifter_block(pcode, 0x600, 0x608);
+        // Set the block exit to a conditional branch on $tmp_cmp.
+        block.exit = BlockExit::Branch {
+            target: icicle_vm::cpu::lifter::Target::External(pcode::Value::Const(0xDEAD, 4)),
+            fallthrough: icicle_vm::cpu::lifter::Target::External(pcode::Value::Const(0xBEEF, 4)),
+            cond: pcode::Value::Var(tmp_cmp),
+        };
+
+        let mut read_sites: HashMap<u64, StreamKey> = HashMap::new();
+        read_sites.insert(0x600, 0xDEAD_BEEF); // mmio_ctrl stream key
+
+        let mut slice = DemandSlice::default(); // no data demand — only control
+        slice.process_block_backward(&block, &[], &read_sites, true /* inject_control */, None);
+
+        assert!(
+            slice.sources_ctrl.contains(&AccessContext::new(0x600, 0xDEAD_BEEF)),
+            "MMIO load feeding the branch condition must be recorded as a Control source; \
+             got sources_ctrl={:?}",
+            slice.sources_ctrl
         );
     }
 }
