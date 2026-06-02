@@ -82,6 +82,7 @@ impl DemandSlice {
         mmio_ranges: &[Range<u64>],
         read_sites: &HashMap<u64, StreamKey>,
         inject_control: bool,
+        cutoff_pc: Option<u64>,
     ) {
         // Forward pass to map (instruction_index → current_pc) for source contexts.
         let mut stmt_pcs = vec![block.start; block.pcode.instructions.len()];
@@ -97,6 +98,19 @@ impl DemandSlice {
 
         // Backward pass.
         for (idx, stmt) in block.pcode.instructions.iter().enumerate().rev() {
+            // In the block that *contains* B, ignore every instruction that executes
+            // after B's load (pc > cutoff_pc).  Such instructions run *after* B has
+            // already read, so they cannot be a dependency source of B.  Crucially, a
+            // later redefinition of B's base register in the same block (e.g.
+            // `LDR Rbase, [other_mmio]` placed below B) would otherwise have its output
+            // match the demanded base varnode and be wrongly recorded as an Address
+            // source — the exact false positive observed for streams 0x58000004 and
+            // 0x58000490.
+            if let Some(max) = cutoff_pc {
+                if stmt_pcs[idx] > max {
+                    continue;
+                }
+            }
             let out = stmt.output;
             if out.is_invalid() {
                 continue;
@@ -399,7 +413,7 @@ impl MmioFlowAnalyzer {
 
         // Backward CFG traversal: intra-function (depth=0) + inter-function up to
         // `max_call_levels` call-stack levels.
-        self.backward_traverse(code, &reverse_cfg, block.start, &mut slice, 0);
+        self.backward_traverse(code, &reverse_cfg, block.start, readwatch_pc, &mut slice, 0);
 
         if dbg {
             eprintln!("[flow] RAW sources_addr={:?}", slice.sources_addr);
@@ -428,6 +442,7 @@ impl MmioFlowAnalyzer {
         code: &BlockTable,
         reverse_cfg: &ReverseCfg,
         start_addr: u64,
+        readwatch_pc: u64,
         slice: &mut DemandSlice,
         call_depth: usize,
     ) {
@@ -455,6 +470,11 @@ impl MmioFlowAnalyzer {
             // a control dependency (that branch fires after B).  Predecessor blocks do.
             let inject_control = addr != start_addr;
 
+            // Only the block that contains B applies the post-B instruction cutoff: within
+            // that block, instructions after readwatch_pc execute after B's read and must be
+            // ignored.  Predecessor blocks execute entirely before B, so no cutoff applies.
+            let cutoff_pc = if addr == start_addr { Some(readwatch_pc) } else { None };
+
             if std::env::var_os("DUMP_FLOW").is_some() {
                 eprintln!(
                     "[flow]  traverse block [{:#x}..{:#x}) visit={} inject_ctrl={} \
@@ -470,6 +490,7 @@ impl MmioFlowAnalyzer {
                 &self.mmio_ranges,
                 &self.mmio_read_sites,
                 inject_control,
+                cutoff_pc,
             );
             slice.strip_temporaries();
             let after = (slice.demand_count(), slice.source_count());
@@ -582,7 +603,7 @@ mod tests {
         read_sites.insert(0x100, 0x5801_0008);
 
         let mut slice = DemandSlice::seed(tgt_addr);
-        slice.process_block_backward(&block, &[], &read_sites, false);
+        slice.process_block_backward(&block, &[], &read_sites, false, None);
 
         // With the fix the chain stops at the non-MMIO load: no spurious Address source.
         assert!(
@@ -611,7 +632,7 @@ mod tests {
         read_sites.insert(0x200, 0x5800_0000);
 
         let mut slice = DemandSlice::seed(tgt_addr);
-        slice.process_block_backward(&block, &[], &read_sites, false);
+        slice.process_block_backward(&block, &[], &read_sites, false, None);
 
         assert!(
             slice.sources_addr.contains(&AccessContext::new(0x200, 0x5800_0000)),
@@ -647,7 +668,7 @@ mod tests {
         // Seed with r5 (simulates seed_demand_from_block picking the address input of the
         // self-referential load). id=5 will also match the load's out.id=5.
         let mut slice = DemandSlice::seed(r5);
-        slice.process_block_backward(&block, &[], &read_sites, false);
+        slice.process_block_backward(&block, &[], &read_sites, false, None);
 
         // At the process_block_backward level the source IS recorded (that's correct
         // behaviour — the slice has no notion of "self").  The self-edge exclusion happens
@@ -693,13 +714,65 @@ mod tests {
         read_sites.insert(0x304, 0xBBBB);
 
         let mut slice = DemandSlice::seed(tgt);
-        slice.process_block_backward(&block, &[], &read_sites, false);
+        slice.process_block_backward(&block, &[], &read_sites, false, None);
 
         assert!(
             slice.sources_addr.contains(&AccessContext::new(0x304, 0xBBBB))
                 && slice.sources_addr.contains(&AccessContext::new(0x300, 0xAAAA)),
             "deep indexed-MMIO chain should yield both MMIO sources, got {:?}",
             slice.sources_addr
+        );
+    }
+
+    /// Regression for the post-B-instruction false positive (Edge 1: 0x58010008→0x58000490,
+    /// Edge 2: 0x58000000→0x58000004).  A *later* instruction in B's own block that redefines
+    /// B's base register must NOT be recorded as a source — it executes after B has read.
+    ///
+    /// Layout (B reads via base register id 30):
+    ///   0x100:  R30 = LOAD[mmioA]   ← the genuine reaching definition of B's base (BEFORE B)
+    ///   0x104:  <B's load uses R30> (readwatch_pc = 0x104; seed demands R30)
+    ///   0x108:  R30 = LOAD[mmioC]   ← a *later* redefinition of R30 (AFTER B)
+    ///
+    /// Without the cutoff the backward pass (end→start) meets 0x108 first, matches the demanded
+    /// R30, and wrongly records mmioC.  With `cutoff_pc = Some(0x104)` the 0x108 load is skipped
+    /// and only the genuine 0x100 source survives.
+    #[test]
+    fn post_readwatch_instruction_is_not_a_source() {
+        let mut pcode = pcode::Block::new();
+        let base = reg(30);
+
+        pcode.push(marker(0x100));
+        pcode.push((base, pcode::Op::Load(0), reg(4))); // genuine def of R30 @0x100 (mmioA)
+        pcode.push(marker(0x104)); // B's load site (readwatch_pc); seed already demands R30
+        pcode.push(marker(0x108));
+        pcode.push((base, pcode::Op::Load(0), reg(5))); // later redefinition @0x108 (mmioC)
+
+        let block = lifter_block(pcode, 0x100, 0x10c);
+
+        let mut read_sites: HashMap<u64, StreamKey> = HashMap::new();
+        read_sites.insert(0x100, 0x5800_0000); // mmioA — the legitimate source
+        read_sites.insert(0x108, 0x5801_0008); // mmioC — the post-B redefinition
+
+        // With the cutoff, only the source at/<=0x104 is recorded.
+        let mut slice = DemandSlice::seed(base);
+        slice.process_block_backward(&block, &[], &read_sites, false, Some(0x104));
+        assert!(
+            slice.sources_addr.contains(&AccessContext::new(0x100, 0x5800_0000)),
+            "genuine pre-B source must be recorded, got {:?}",
+            slice.sources_addr
+        );
+        assert!(
+            !slice.sources_addr.contains(&AccessContext::new(0x108, 0x5801_0008)),
+            "post-B redefinition must NOT be recorded as a source, got {:?}",
+            slice.sources_addr
+        );
+
+        // Sanity: WITHOUT the cutoff the bug reproduces (the later def shadows the real one).
+        let mut slice_nocut = DemandSlice::seed(base);
+        slice_nocut.process_block_backward(&block, &[], &read_sites, false, None);
+        assert!(
+            slice_nocut.sources_addr.contains(&AccessContext::new(0x108, 0x5801_0008)),
+            "without cutoff the post-B redefinition is (wrongly) recorded — guards the fix"
         );
     }
 }
