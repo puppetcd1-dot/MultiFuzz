@@ -121,13 +121,15 @@ impl DemandSlice {
                     // every MMIO read site that has triggered a ReadWatch.
                     if let Some(&saddr) = read_sites.get(&load_pc) {
                         let ctx = AccessContext::new(load_pc, saddr);
-                        tracing::trace!(
-                            "Phase A slice: MMIO load at {:#x} (stream {:#x}) \
-                             triggered — in_data={in_data}, in_ctrl={in_ctrl}, \
-                             out_id={}, demanded_data={:?}, demanded_ctrl={:?}",
-                            load_pc, saddr, out.id,
-                            self.demanded_data, self.demanded_ctrl
-                        );
+                        if std::env::var_os("DUMP_FLOW").is_some() {
+                            eprintln!(
+                                "[flow]   MMIO-load SOURCE recorded: pc={:#x} stream={:#x} \
+                                 out_id={} in_data={} in_ctrl={} \
+                                 (demanded_data={:?} demanded_ctrl={:?})",
+                                load_pc, saddr, out.id, in_data, in_ctrl,
+                                self.demanded_data, self.demanded_ctrl
+                            );
+                        }
                         if in_data {
                             self.sources_addr.insert(ctx);
                         }
@@ -371,19 +373,41 @@ impl MmioFlowAnalyzer {
         // Seed the data channel from the LOAD address varnode at `readwatch_pc`.  The control
         // channel is seeded lazily as predecessor branch conditions are encountered during the
         // backward traversal, so we always traverse even if the data seed is empty.
+        let dbg = std::env::var_os("DUMP_FLOW").is_some();
+        if dbg {
+            eprintln!(
+                "\n[flow] ───── new stream @ readwatch_pc={:#x}  block [{:#x}..{:#x}) ─────",
+                readwatch_pc, block.start, block.end
+            );
+            let mut sites: Vec<(&u64, &StreamKey)> = self.mmio_read_sites.iter().collect();
+            sites.sort();
+            eprintln!("[flow] read_sites ({} entries):", sites.len());
+            for (pc, key) in sites {
+                eprintln!("[flow]    pc={:#x} -> stream={:#x}", pc, key);
+            }
+        }
+
         let mut slice = seed_demand_from_block(block, readwatch_pc);
-        tracing::trace!(
-            "Phase A: readwatch_pc={:#x}, block [{:#x}..{:#x}), \
-             seed demanded_data={:?}, demanded_ctrl={:?}",
-            readwatch_pc, block.start, block.end,
-            slice.demanded_data, slice.demanded_ctrl
-        );
+        if dbg {
+            eprintln!(
+                "[flow] seed demanded_data={:?} demanded_ctrl={:?}",
+                slice.demanded_data, slice.demanded_ctrl
+            );
+        }
 
         let reverse_cfg = build_reverse_cfg(code);
 
         // Backward CFG traversal: intra-function (depth=0) + inter-function up to
         // `max_call_levels` call-stack levels.
         self.backward_traverse(code, &reverse_cfg, block.start, &mut slice, 0);
+
+        if dbg {
+            eprintln!(
+                "[flow] RESULT sources_addr={:?}",
+                slice.sources_addr
+            );
+            eprintln!("[flow] RESULT sources_ctrl={:?}", slice.sources_ctrl);
+        }
 
         slice.into_candidates()
     }
@@ -420,12 +444,14 @@ impl MmioFlowAnalyzer {
             // a control dependency (that branch fires after B).  Predecessor blocks do.
             let inject_control = addr != start_addr;
 
-            tracing::trace!(
-                "Phase A traverse: block [{:#x}..{:#x}) visit={}, inject_ctrl={}, \
-                 demanded_data={:?}, demanded_ctrl={:?}",
-                block.start, block.end, count, inject_control,
-                slice.demanded_data, slice.demanded_ctrl
-            );
+            if std::env::var_os("DUMP_FLOW").is_some() {
+                eprintln!(
+                    "[flow]  traverse block [{:#x}..{:#x}) visit={} inject_ctrl={} \
+                     demanded_data={:?} demanded_ctrl={:?}",
+                    block.start, block.end, count, inject_control,
+                    slice.demanded_data, slice.demanded_ctrl
+                );
+            }
 
             let before = (slice.demand_count(), slice.source_count());
             slice.process_block_backward(
