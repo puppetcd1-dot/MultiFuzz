@@ -143,9 +143,16 @@ impl DemandSlice {
                             }
                         }
                         Value::Var(addr_var) if !addr_var.is_invalid() => {
-                            // Dynamic address: also trace how the pointer was computed (it may
-                            // be an indexed access whose offset is itself MMIO-derived).
-                            ins.push(addr_var.id);
+                            // Trace the address computation chain only for known MMIO loads.
+                            // Non-MMIO loads (flash literal-pool reads like `LDR Rd, =const`,
+                            // RAM struct accesses) are not dependency sources.  Propagating
+                            // their address varnode would eventually demand the PC register
+                            // (ARM PC-relative literal-pool addressing lifts as
+                            // `$tmp = INT_ADD(PC, off); Rd = LOAD($tmp)`), which then spreads
+                            // across the entire CFG and produces spurious Address edges.
+                            if read_sites.contains_key(&load_pc) {
+                                ins.push(addr_var.id);
+                            }
                         }
                         _ => {}
                     }
