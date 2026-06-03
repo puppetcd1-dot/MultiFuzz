@@ -172,40 +172,65 @@ impl StreamRelationGraph {
         }
     }
 
-    /// Confirm or upgrade an edge from taint analysis (Phase B output).
+    /// Confirm or reclassify an edge from taint analysis (Phase B output).
+    ///
+    /// **Upgrade-only — Phase B never invents relationships.**  Phase A already
+    /// over-approximates dependence (a backward demand slice reaches *every* MMIO
+    /// read that could feed B's address or any gating branch on a path to B), so
+    /// every genuine dependency is already present as a `Structural` candidate.
+    /// Phase B's role is purely to *confirm* (raise confidence) and *reclassify*
+    /// (e.g. `Control` → `Length`) those candidates from observed runtime taint.
+    ///
+    /// Without this restriction the dynamic gating accumulator — which attributes
+    /// every source that ever taints a branch condition to every later MMIO read —
+    /// would materialise an (almost) complete bipartite graph of spurious edges.
+    /// An observation with no structural backing (no candidate with the same
+    /// `source.addr → target.addr`) is therefore a taint over-approximation
+    /// artifact and is dropped.
+    ///
+    /// Returns `true` if at least one structural candidate was upgraded.
     pub fn confirm_edge(
         &mut self,
         source: AccessContext,
         target: AccessContext,
         kind: EdgeKind,
         relation: Option<Relation>,
-    ) {
-        // Upgrade an existing structural candidate if one exists (exact context match on
-        // both endpoints — several targets may share an address at different PCs).
-        if let Some(indices) = self.incoming.get(&target.addr).cloned() {
-            for idx in indices {
-                let edge = &mut self.edges[idx];
-                if edge.source == source && edge.target == target {
-                    edge.kind = kind;
-                    edge.confidence = Confidence::TaintConfirmed;
-                    if relation.is_some() {
-                        edge.relation = relation;
-                    }
-                    return;
+    ) -> bool {
+        let Some(indices) = self.incoming.get(&target.addr).cloned() else {
+            return false;
+        };
+
+        // Prefer an exact context match (same PCs on both endpoints): upgrade only
+        // that one edge so distinct semantic roles of an address stay distinct.
+        for &idx in &indices {
+            let edge = &mut self.edges[idx];
+            if edge.source == source && edge.target == target {
+                edge.kind = kind;
+                edge.confidence = Confidence::TaintConfirmed;
+                if relation.is_some() {
+                    edge.relation = relation;
                 }
+                return true;
             }
         }
-        // No prior structural candidate — insert a new confirmed edge.
-        let idx = self.edges.len();
-        self.edges.push(StreamEdge {
-            source,
-            target,
-            kind,
-            confidence: Confidence::TaintConfirmed,
-            relation,
-        });
-        self.outgoing.entry(source.addr).or_default().push(idx);
-        self.incoming.entry(target.addr).or_default().push(idx);
+
+        // Otherwise fall back to an address-pair match: Phase A and Phase B may
+        // attribute an access to different PCs (e.g. the slice anchor vs. the load
+        // marker), but the stream-level relationship is the same.  Upgrade every
+        // structurally-backed candidate for this address pair.
+        let mut upgraded = false;
+        for &idx in &indices {
+            let edge = &mut self.edges[idx];
+            if edge.source.addr == source.addr {
+                edge.kind = kind;
+                edge.confidence = Confidence::TaintConfirmed;
+                if relation.is_some() {
+                    edge.relation = relation.clone();
+                }
+                upgraded = true;
+            }
+        }
+        upgraded
     }
 
     /// True if an edge with this exact context pair already exists.
@@ -264,6 +289,13 @@ impl StreamRelationGraph {
         factor
     }
 
+    #[cfg(test)]
+    fn confidence_of(&self, source: StreamKey, target: StreamKey) -> Option<Confidence> {
+        self.incoming.get(&target).and_then(|v| {
+            v.iter().map(|&i| &self.edges[i]).find(|e| e.source.addr == source).map(|e| e.confidence)
+        })
+    }
+
     /// Serialize the graph as a JSON array of edges (for offline evaluation / debugging).
     pub fn to_json(&self) -> String {
         let mut s = String::from("[\n");
@@ -285,5 +317,63 @@ impl StreamRelationGraph {
         }
         s.push_str("\n]\n");
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(pc: u64, addr: u64) -> AccessContext {
+        AccessContext::new(pc, addr)
+    }
+
+    /// Phase B must NOT invent edges: an observation with no structural backing is
+    /// dropped, so the confirmed graph can never exceed Phase A's candidate set.
+    /// This is the regression guard against the near-complete bipartite blow-up.
+    #[test]
+    fn confirm_without_structural_backing_is_dropped() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+
+        let upgraded = g.confirm_edge(a, b, EdgeKind::Control, None);
+        assert!(!upgraded, "unbacked confirmation must report no upgrade");
+        assert_eq!(g.edge_count(), 0, "Phase B must not invent an edge from nothing");
+    }
+
+    /// A structural candidate is upgraded in place (no new row) and reclassified.
+    #[test]
+    fn confirm_upgrades_structural_candidate_in_place() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+        assert_eq!(g.confidence_of(0x5800_0000, 0x5800_0004), Some(Confidence::Structural));
+
+        let upgraded = g.confirm_edge(a, b, EdgeKind::Length, None);
+        assert!(upgraded);
+        assert_eq!(g.edge_count(), 1, "confirmation upgrades in place, never adds a row");
+        assert_eq!(g.confidence_of(0x5800_0000, 0x5800_0004), Some(Confidence::TaintConfirmed));
+        assert_eq!(g.governors(0x5800_0004).next().unwrap().kind, EdgeKind::Length);
+    }
+
+    /// PC mismatch between Phase A and Phase B still confirms via the address pair,
+    /// and the confirmed-edge count stays bounded by the structural candidate count.
+    #[test]
+    fn confirm_matches_by_address_pair_when_pc_differs() {
+        let mut g = StreamRelationGraph::new();
+        let a_struct = ctx(0x10, 0x5800_0000);
+        let b_struct = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b_struct, &[(a_struct, EdgeKind::Control)]);
+
+        // Phase B observed the same streams at different PCs.
+        let a_obs = ctx(0x99, 0x5800_0000);
+        let b_obs = ctx(0xaa, 0x5800_0004);
+        let upgraded = g.confirm_edge(a_obs, b_obs, EdgeKind::Control, None);
+
+        assert!(upgraded);
+        assert_eq!(g.edge_count(), 1, "no duplicate row for the PC-shifted observation");
+        assert_eq!(g.confidence_of(0x5800_0000, 0x5800_0004), Some(Confidence::TaintConfirmed));
     }
 }

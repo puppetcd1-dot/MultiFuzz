@@ -780,6 +780,10 @@ mod tests {
         let src = AccessContext::new(0x200, 0x5800_0008);
         let tgt = AccessContext::new(0x300, 0x5800_0000);
 
+        // Phase B is upgrade-only: it confirms a Phase-A structural candidate, it
+        // never invents edges.  Seed the structural candidate first.
+        graph.add_structural_candidates(tgt, &[(src, EdgeKind::Control)]);
+
         // Two passes with identity samples (count == value) → Identity relation fit.
         for v in [4u64, 7u64] {
             let result = PassResult {
