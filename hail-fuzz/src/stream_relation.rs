@@ -29,16 +29,12 @@ impl AccessContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
-    /// Source stream may structurally govern target; type not yet classified.
-    Unclassified,
     /// Value of source stream was used to compute the MMIO address of target.
     Address,
     /// Value of source stream gated a branch condition leading to target.
     Control,
     /// Value of source stream governed the loop trip count / copy size for target.
     Length,
-    /// Value of source stream governed the index/stride into target's buffer.
-    Stride,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +139,11 @@ impl StreamRelationGraph {
     /// Enable/disable the mutation-assistance bias at runtime (extraction is unaffected).
     pub fn set_assist_enabled(&mut self, enabled: bool) {
         self.assist_enabled = enabled;
+    }
+
+    /// Whether mutation assistance (weighting + coupled mutation) is active.
+    pub fn assist_enabled(&self) -> bool {
+        self.assist_enabled
     }
 
     /// Add structurally-inferred candidate edges (Phase A output).
@@ -263,7 +264,7 @@ impl StreamRelationGraph {
     /// Mutation-assistance hook: how much more often a stream at `addr` should be mutated
     /// because it participates in inter-stream dependencies.  Returns a multiplier ≥ 1.0.
     ///
-    /// Value-flow edges (Address/Length/Stride) are robust to address-keying and get the
+    /// Value-flow edges (Address/Length) are robust to address-keying and get the
     /// strongest boost; Control edges are coarser (the same status register may be checked
     /// at several sites) and get a smaller boost.  A `TaintConfirmed` edge is weighted above
     /// a merely `Structural` one.
@@ -276,8 +277,8 @@ impl StreamRelationGraph {
             for &idx in list {
                 let edge = &self.edges[idx];
                 let base = match edge.kind {
-                    EdgeKind::Address | EdgeKind::Length | EdgeKind::Stride => 4.0,
-                    EdgeKind::Control | EdgeKind::Unclassified => 2.0,
+                    EdgeKind::Address | EdgeKind::Length => 4.0,
+                    EdgeKind::Control => 2.0,
                 };
                 let confirmed_bonus = match edge.confidence {
                     Confidence::TaintConfirmed => 1.5,
