@@ -41,7 +41,7 @@ use icicle_vm::{
     cpu::{BlockGroup, Cpu},
     BlockTable, Vm,
 };
-use pcode::{Op, Value, VarId};
+use pcode::{Op, Value, VarId, VarNode};
 
 use crate::{
     input::StreamKey,
@@ -175,6 +175,12 @@ pub struct PhaseBEngine {
     target_reads: HashMap<AccessContext, u64>,
     /// Last concrete value loaded at each MMIO context (for relation samples).
     source_last_val: HashMap<AccessContext, u64>,
+    /// MMIO source reads whose value was not yet observable (production: `LiveEnv`
+    /// suppresses MMIO reads to avoid consuming a fuzz byte).  Each entry is the
+    /// `(context, destination register)` of a source load; the value is captured at
+    /// the *next* block entry, by which point the real CPU has executed the load and
+    /// the register holds the loaded value (block-entry hooks fire pre-execution).
+    pending_src_vals: Vec<(AccessContext, VarId)>,
     /// Tainted branch PCs and how many times each was evaluated tainted (loop ⇒ ≥2).
     branch_visits: HashMap<u64, u64>,
     /// Accumulated gating `(source, branch_pc)` pairs (taint-confirmed).
@@ -197,6 +203,7 @@ impl PhaseBEngine {
             cur_pc: 0,
             target_reads: HashMap::new(),
             source_last_val: HashMap::new(),
+            pending_src_vals: Vec::new(),
             branch_visits: HashMap::new(),
             gating: Vec::new(),
             gating_set: HashSet::new(),
@@ -215,6 +222,7 @@ impl PhaseBEngine {
         self.cur_pc = 0;
         self.target_reads.clear();
         self.source_last_val.clear();
+        self.pending_src_vals.clear();
         self.branch_visits.clear();
         self.gating.clear();
         self.gating_set.clear();
@@ -279,6 +287,11 @@ impl PhaseBEngine {
         self.shadow.index.contexts_in_tag(tag)
     }
 
+    #[cfg(test)]
+    fn source_value(&self, ctx: AccessContext) -> Option<u64> {
+        self.source_last_val.get(&ctx).copied()
+    }
+
     // ── block interpretation ───────────────────────────────────────────────────
 
     /// Interpret a single basic block, updating shadow state and observations.
@@ -288,6 +301,16 @@ impl PhaseBEngine {
         self.def_concrete.clear();
         self.def_taint.clear();
         self.cur_pc = block.start;
+
+        // Capture the concrete value of any source MMIO read from the previous block:
+        // its load has now executed, so the destination register holds the loaded value.
+        if !self.pending_src_vals.is_empty() {
+            for (ctx, reg) in std::mem::take(&mut self.pending_src_vals) {
+                if let Some(v) = env.read_value(Value::Var(VarNode::new(reg, 4))) {
+                    self.source_last_val.entry(ctx).or_insert(v);
+                }
+            }
+        }
 
         for stmt in &block.pcode.instructions {
             match stmt.op {
@@ -326,12 +349,16 @@ impl PhaseBEngine {
                             }
                         }
 
-                        // Capture the loaded value for relation samples (non-MMIO read only;
-                        // LiveEnv suppresses MMIO reads, so this is `None` in production but
-                        // available under the mock environment used in tests).
+                        // Capture the loaded value for relation samples.  In production
+                        // `LiveEnv` suppresses MMIO reads (returns `None`) to avoid consuming
+                        // a fuzz byte, so defer to the next block entry where the register
+                        // holds the value; under the mock environment the value is available
+                        // immediately.
                         let loaded = addr.and_then(|a| env.read_mem(a, size));
                         if let Some(v) = loaded {
                             self.source_last_val.insert(ctx, v);
+                        } else if stmt.output.id > 0 {
+                            self.pending_src_vals.push((ctx, stmt.output.id));
                         }
 
                         // Inject the source taint onto the destination register.
@@ -805,6 +832,39 @@ mod tests {
         assert_eq!(edge.kind, EdgeKind::Length);
         assert_eq!(edge.confidence, Confidence::TaintConfirmed);
         assert!(edge.relation.is_some(), "a relation should be fitted from the samples");
+    }
+
+    /// When the MMIO read value is suppressed at load time (production `LiveEnv`),
+    /// the concrete source value is recovered from the destination register at the
+    /// next block entry — enabling `Length` relation fitting across passes.
+    #[test]
+    fn deferred_source_value_capture_from_register() {
+        let mut e = engine();
+        e.read_sites.insert(0x100, 0x5800_0008); // source A
+
+        // Block 1 @0x100: r5 = LOAD[r9]  (MMIO source; value suppressed → deferred).
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x100));
+        p1.push((reg(5), Op::Load(0), reg(9)));
+        let b1 = lifter_block(p1, 0x100, 0x104, BlockExit::invalid());
+
+        // Block 2 @0x104: unrelated marker; its entry drains the pending capture.
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x104));
+        let b2 = lifter_block(p2, 0x104, 0x108, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x5800_0008); // address register
+        // No backing memory at the MMIO address → read_mem returns None (suppressed).
+
+        e.run_block(&b1, &mut env);
+        let src = AccessContext::new(0x100, 0x5800_0008);
+        assert_eq!(e.source_value(src), None, "value not yet observable at load time");
+
+        // The real load has now executed: the destination register holds the value.
+        env.regs.insert(5, 0x2a);
+        e.run_block(&b2, &mut env);
+        assert_eq!(e.source_value(src), Some(0x2a), "value recovered at next block entry");
     }
 
     /// A call (PcodeOp) clears r0–r3 taint so it cannot leak across an opaque call.

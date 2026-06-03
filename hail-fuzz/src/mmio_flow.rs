@@ -278,14 +278,6 @@ impl DemandSlice {
         self.demanded_ctrl.retain(|id| *id >= 0);
     }
 
-    /// Merge another slice into this one (CFG join point).
-    pub fn merge(&mut self, other: &DemandSlice) {
-        self.demanded_data.extend(other.demanded_data.iter().copied());
-        self.demanded_ctrl.extend(other.demanded_ctrl.iter().copied());
-        self.sources_addr.extend(other.sources_addr.iter().copied());
-        self.sources_ctrl.extend(other.sources_ctrl.iter().copied());
-    }
-
     /// Collapse discovered sources into classified `(context, kind)` candidates.
     /// Address provenance takes priority over Control when a context appears on both.
     fn into_candidates(self) -> Vec<(AccessContext, EdgeKind)> {

@@ -29,21 +29,8 @@ const OVERFLOW_BIT: u64 = 1 << 62;
 const INLINE_CAPACITY: usize = 62;
 
 impl TaintTag {
-    pub fn clean() -> Self {
-        Self::Clean
-    }
-
     pub fn is_clean(&self) -> bool {
         matches!(self, TaintTag::Clean)
-    }
-
-    /// True if the inline overflow sentinel is set (stream count exceeded inline capacity).
-    pub fn has_overflow(&self) -> bool {
-        match self {
-            TaintTag::Inline(bits) => bits & OVERFLOW_BIT != 0,
-            TaintTag::Chunked(_) => false, // Chunked has no overflow limit up to MAX_STREAMS
-            TaintTag::Clean => false,
-        }
     }
 
     /// Set bit `stream_index` in this tag.
@@ -101,23 +88,6 @@ impl TaintTag {
                 // Inline bits go into chunk 0 (inline is ≤62 bits, all in chunk 0).
                 chunks[0] |= a & !OVERFLOW_BIT;
                 TaintTag::Chunked(Box::new(chunks))
-            }
-        }
-    }
-
-    /// Check whether this tag has any bit set in common with `other`.
-    pub fn overlaps(&self, other: &TaintTag) -> bool {
-        match (self, other) {
-            (TaintTag::Clean, _) | (_, TaintTag::Clean) => false,
-            (TaintTag::Inline(a), TaintTag::Inline(b)) => a & b != 0,
-            (TaintTag::Chunked(a), TaintTag::Chunked(b)) => {
-                let len = a.len().min(b.len());
-                (0..len).any(|i| a[i] & b[i] != 0)
-            }
-            (TaintTag::Inline(a), TaintTag::Chunked(b))
-            | (TaintTag::Chunked(b), TaintTag::Inline(a)) => {
-                // Inline bits 0-61 are all held in chunk 0 of a Chunked tag.
-                b.first().map_or(false, |&chunk0| chunk0 & a != 0)
             }
         }
     }
@@ -223,10 +193,6 @@ impl StreamIndex {
     pub fn contexts_in_tag(&self, tag: &TaintTag) -> Vec<AccessContext> {
         tag.iter_streams().filter_map(|bit| self.bit_to_ctx(bit)).collect()
     }
-
-    pub fn len(&self) -> usize {
-        self.next_bit
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -260,17 +226,6 @@ impl ShadowState {
     }
 
     // ── Source injection ────────────────────────────────────────────────────
-
-    /// Mark `size` bytes at `phys_addr` as tainted by the access context `ctx`.
-    /// Called at each MMIO read (Phase B source hook in `mmio.rs`).
-    /// Using the full `(PC, address)` context ensures that the same peripheral
-    /// register read at different call sites gets separate taint bits.
-    pub fn taint_mmio_read(&mut self, ctx: AccessContext, phys_addr: u32, size: usize) {
-        let tag = self.tag_for_context(ctx);
-        for i in 0..size as u32 {
-            self.mem.insert(phys_addr + i, tag.clone());
-        }
-    }
 
     fn tag_for_context(&mut self, ctx: AccessContext) -> TaintTag {
         match self.index.get_or_insert(ctx) {
@@ -330,95 +285,15 @@ impl ShadowState {
         }
     }
 
-    // ── Propagation helpers (called from CodeInjector hooks) ────────────────
-
-    /// Propagate taint through a unary op: `dst_tag = tag(src)`.
-    pub fn propagate_unary(&mut self, dst_id: i16, src: pcode::VarNode) {
-        let tag = self.reg_tag(src.id);
-        self.set_reg_tag(dst_id, tag);
-    }
-
-    /// Propagate taint through a binary op: `dst_tag = tag(a) ∪ tag(b)`.
-    pub fn propagate_binary(
-        &mut self,
-        dst_id: i16,
-        a: pcode::VarNode,
-        b: pcode::Value,
-    ) {
-        let tag_a = self.reg_tag(a.id);
-        let tag_b = match b {
-            pcode::Value::Var(vn) => self.reg_tag(vn.id),
-            pcode::Value::Const(..) => TaintTag::Clean,
-        };
-        self.set_reg_tag(dst_id, tag_a.union(&tag_b));
-    }
-
-    /// Propagate taint through a LOAD: `dst_tag = ∪ mem_tag[runtime_addr..+size]`.
-    pub fn propagate_load(&mut self, dst_id: i16, runtime_addr: u32, size: usize) {
-        let tag = self.mem_tag_range(runtime_addr, size);
-        self.set_reg_tag(dst_id, tag);
-    }
-
-    /// Propagate taint through a STORE: `mem_tag[addr..+size] = tag(val) ∪ tag(addr_reg)`.
-    pub fn propagate_store(
-        &mut self,
-        runtime_addr: u32,
-        size: usize,
-        val: pcode::VarNode,
-        addr_reg: pcode::VarNode,
-    ) {
-        let tag_val  = self.reg_tag(val.id);
-        let tag_addr = self.reg_tag(addr_reg.id);
-        let combined = tag_val.union(&tag_addr);
-        self.set_mem_tag_range(runtime_addr, size, combined);
-    }
+    // ── Call handling ───────────────────────────────────────────────────────
 
     /// Conservative CALL handling: kill taint on r0–r3 (accept under-tainting).
-    /// Known-function summaries should override this before it is called.
+    /// Known-function summaries (memcpy/memset/…) would override this once callee
+    /// identification (symbol/PLT resolution) is available; until then we kill.
     pub fn kill_call_regs(&mut self) {
         for reg_id in 0..4i16 {
             self.set_reg_tag(reg_id, TaintTag::Clean);
         }
-    }
-
-    /// Known-function summary for memcpy(dst=r0, src=r1, n=r2):
-    /// propagate shadow_mem[src..src+n] → shadow_mem[dst..dst+n].
-    pub fn summary_memcpy(&mut self, dst: u32, src: u32, n: u32) {
-        for i in 0..n {
-            let tag = self.mem_tag(src + i);
-            if tag.is_clean() {
-                self.mem.remove(&(dst + i));
-            } else {
-                self.mem.insert(dst + i, tag);
-            }
-        }
-        // r0 (return = dst pointer) carries no value taint.
-        self.set_reg_tag(0, TaintTag::Clean);
-    }
-
-    /// Known-function summary for memset(dst=r0, c=r1, n=r2):
-    /// propagate tag(c) → shadow_mem[dst..dst+n].
-    pub fn summary_memset(&mut self, dst: u32, n: u32, fill_tag: TaintTag) {
-        self.set_mem_tag_range(dst, n as usize, fill_tag);
-        self.set_reg_tag(0, TaintTag::Clean);
-    }
-
-    // ── Sink checks ─────────────────────────────────────────────────────────
-
-    /// Returns the access contexts that taint the given register.
-    /// Callers that only need the stream address can project via `.addr`.
-    pub fn tainted_contexts_in_reg(&self, var_id: i16) -> Vec<AccessContext> {
-        self.index.contexts_in_tag(&self.reg_tag(var_id))
-    }
-
-    /// Returns the access contexts that taint a memory range.
-    pub fn tainted_contexts_in_mem(&self, addr: u32, size: usize) -> Vec<AccessContext> {
-        self.index.contexts_in_tag(&self.mem_tag_range(addr, size))
-    }
-
-    /// True if the tag has the overflow sentinel — attribution is uncertain.
-    pub fn is_overflowed_reg(&self, var_id: i16) -> bool {
-        self.reg_tag(var_id).has_overflow()
     }
 }
 
@@ -461,38 +336,24 @@ mod tests {
         let u = a.union(&b);
         let got: std::collections::BTreeSet<usize> = u.iter_streams().collect();
         assert_eq!(got, [3usize, 10, 100].into_iter().collect());
-        assert!(a.overlaps(&b), "shared bit 10 must register as overlap");
     }
 
-    /// The StreamIndex sets the overflow sentinel past capacity rather than silently dropping.
+    /// The StreamIndex assigns the overflow sentinel past capacity rather than silently
+    /// dropping a stream: the first two contexts stay precisely attributable, the third
+    /// gets only the sentinel bit (no precise attribution) and nothing panics.
     #[test]
     fn index_overflow_sets_sentinel_no_panic() {
         let mut shadow = ShadowState { index: StreamIndex::new(2), ..ShadowState::new() };
-        // Two contexts fit; the third overflows.
-        shadow.taint_mmio_read(ctx(0x10), 0x2000_0000, 4);
-        shadow.taint_mmio_read(ctx(0x20), 0x2000_0100, 4);
-        shadow.taint_mmio_read(ctx(0x30), 0x2000_0200, 4); // overflow
+        // Two contexts fit the index; the third exceeds capacity.
+        let t1 = shadow.source_tag(ctx(0x10));
+        let t2 = shadow.source_tag(ctx(0x20));
+        let t3 = shadow.source_tag(ctx(0x30)); // overflow
 
-        // The overflowed read carries the sentinel, attribution is flagged uncertain.
-        assert!(shadow.mem_tag(0x2000_0200).has_overflow());
-        // The first two remain precisely attributable.
-        let attributed = shadow.tainted_contexts_in_mem(0x2000_0000, 4);
-        assert_eq!(attributed, vec![ctx(0x10)]);
-    }
-
-    /// `memcpy` summary copies source taint to the destination range; r0 ends clean.
-    #[test]
-    fn memcpy_summary_propagates_range_taint() {
-        let mut shadow = ShadowState::new();
-        shadow.taint_mmio_read(ctx(0x40), 0x2000_0000, 4); // tainted src bytes
-
-        shadow.set_reg_tag(0, shadow.mem_tag(0x2000_0000)); // pretend r0 had src taint
-        shadow.summary_memcpy(0x2000_1000, 0x2000_0000, 4);
-
-        // Destination now carries the source's taint.
-        assert_eq!(shadow.tainted_contexts_in_mem(0x2000_1000, 4), vec![ctx(0x40)]);
-        // Return register (r0 = dst pointer) is untainted by the copy itself.
-        assert!(shadow.reg_tag(0).is_clean());
+        assert_eq!(shadow.index.contexts_in_tag(&t1), vec![ctx(0x10)]);
+        assert_eq!(shadow.index.contexts_in_tag(&t2), vec![ctx(0x20)]);
+        // The overflowed context carries only the sentinel bit, so it has no precise
+        // attribution — a known-bounded false negative, not a silent error.
+        assert!(shadow.index.contexts_in_tag(&t3).is_empty());
     }
 
     /// An opaque CALL kills r0–r3 taint (plan Fix 4: kill over union).
