@@ -171,10 +171,15 @@ pub(crate) fn get_non_empty_streams(data: &MultiStream) -> Vec<(StreamKey, usize
 /// Assign weights that control often each stream is mutated based on on the colorization rate.
 /// This avoids spending effort on mutating streams that have little to zero impact on the path of
 /// the input.
+///
+/// `frontier_boosts` is an optional per-stream multiplier (same length as `streams`) that adds
+/// extra weight to streams governing underexplored targets — coverage-directed bias from the
+/// relation graph.  Pass an empty slice to disable frontier boosting.
 pub(crate) fn get_stream_weights(
     fuzzer: &mut Fuzzer,
     id: usize,
     streams: &[(StreamKey, usize)],
+    frontier_boosts: &[f64],
 ) -> rand_distr::WeightedAliasIndex<f64> {
     // Currently even streams that are impactful often have a very high colorization rate, this can
     // occur when a 32-bit read performed but only the low 8 are used. Currently we only adjust
@@ -200,18 +205,12 @@ pub(crate) fn get_stream_weights(
     let weights = colorization_rates
         .into_iter()
         .zip(relation_boosts)
-        .map(|(x, boost)| (if x > COLORIZATION_THRESHOLD { 0.01 } else { 1.0 }) * boost)
+        .enumerate()
+        .map(|(i, (x, boost))| {
+            let frontier = if i < frontier_boosts.len() { frontier_boosts[i] } else { 1.0 };
+            (if x > COLORIZATION_THRESHOLD { 0.01 } else { 1.0 }) * boost * frontier
+        })
         .collect();
-
-    // We could adjust the weights such that streams with higher colorization rates are
-    // mutated more often, however because of oversized reads, interesting data often has a higher
-    // than expected colorization rate.
-    //
-    // let min_rate = *colorization_rates.iter().min_by(|a, b| a.total_cmp(b)).unwrap_or(&0.0);
-    // let weights = colorization_rates
-    //     .into_iter()
-    //     .map(|x| (1.0 - (x - min_rate) / (1.0 - min_rate)).max(0.01))
-    //     .collect();
 
     rand_distr::WeightedAliasIndex::new(weights).unwrap()
 }

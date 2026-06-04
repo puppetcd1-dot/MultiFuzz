@@ -69,6 +69,25 @@ impl Relation {
         }
     }
 
+    /// Inverse: given an expected count_b, return a source value val_a such that
+    /// `apply(val_a) ≈ count_b`.  Returns `None` when the relation is degenerate
+    /// (k == 0 in Linear) or the result would be negative (no valid val_a exists).
+    pub fn invert(&self, count_b: u64) -> Option<u64> {
+        match self.kind {
+            RelKind::Identity => Some(count_b),
+            RelKind::Half => Some(count_b.saturating_mul(2)),
+            RelKind::Linear { k, c } => {
+                if k == 0 {
+                    return None;
+                }
+                // val_a = (count_b - c) / k; use Euclidean division for correct rounding.
+                let numerator = (count_b as i64).saturating_sub(c);
+                let result = numerator.div_euclid(k);
+                if result < 0 { None } else { Some(result as u64) }
+            }
+        }
+    }
+
     /// Fit a relation from (val_a, count_b) sample pairs.
     pub fn fit(pairs: &[(u64, u64)]) -> Option<Self> {
         if pairs.is_empty() {
@@ -327,6 +346,46 @@ mod tests {
 
     fn ctx(pc: u64, addr: u64) -> AccessContext {
         AccessContext::new(pc, addr)
+    }
+
+    /// apply(invert(x)) must round-trip for all valid relation kinds.
+    #[test]
+    fn relation_invert_round_trips() {
+        // Identity: invert is the identity.
+        let r = Relation { kind: RelKind::Identity };
+        assert_eq!(r.invert(0), Some(0));
+        assert_eq!(r.invert(5), Some(5));
+        assert_eq!(r.apply(r.invert(99).unwrap()), 99);
+
+        // Half: invert doubles.
+        let r = Relation { kind: RelKind::Half };
+        assert_eq!(r.invert(4), Some(8));
+        assert_eq!(r.apply(8), 4);
+        assert_eq!(r.invert(0), Some(0));
+
+        // Linear{k=2, c=1}: count = 2*val + 1 → val = (count − 1) / 2.
+        let r = Relation { kind: RelKind::Linear { k: 2, c: 1 } };
+        assert_eq!(r.invert(5), Some(2));   // (5−1)/2 = 2
+        assert_eq!(r.apply(2), 5);          // 2*2+1 = 5
+        assert_eq!(r.invert(1), Some(0));   // boundary: val = 0
+
+        // Linear with k=0 → degenerate, returns None.
+        let r = Relation { kind: RelKind::Linear { k: 0, c: 5 } };
+        assert_eq!(r.invert(5), None);
+
+        // Linear with k=1, c=0 → same as identity.
+        let r = Relation { kind: RelKind::Linear { k: 1, c: 0 } };
+        assert_eq!(r.invert(7), Some(7));
+        assert_eq!(r.apply(r.invert(42).unwrap()), 42);
+
+        // Negative c: count = val + (-3) → val = count + 3.
+        let r = Relation { kind: RelKind::Linear { k: 1, c: -3 } };
+        assert_eq!(r.invert(0), Some(3));
+        assert_eq!(r.apply(3), 0);
+
+        // Result would be negative → None.
+        let r = Relation { kind: RelKind::Linear { k: 1, c: 10 } };
+        assert_eq!(r.invert(5), None); // (5 - 10) / 1 = -5 < 0
     }
 
     /// Phase B must NOT invent edges: an observation with no structural backing is

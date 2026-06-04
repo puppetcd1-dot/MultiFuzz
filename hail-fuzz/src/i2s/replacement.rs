@@ -47,7 +47,7 @@ impl I2SRandomReplacement {
         if streams.is_empty() {
             return None;
         }
-        let stream_distr = get_stream_weights(fuzzer, input_id, &streams);
+        let stream_distr = get_stream_weights(fuzzer, input_id, &streams, &[]);
 
         Some(Self {
             comparisons,
