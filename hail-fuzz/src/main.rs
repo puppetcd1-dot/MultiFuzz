@@ -547,6 +547,13 @@ pub(crate) struct Fuzzer {
     pub length_store: phase_b::LengthSampleStore,
     /// Counter used to sample which new-stream events trigger a Phase B taint pass.
     pub phase_b_counter: u64,
+    /// Coverage-directed mutation weights: maps each MMIO stream that gates an uncovered
+    /// frontier branch to a boost factor (≥ 1.0).  Recomputed periodically from the true
+    /// coverage frontier (see `maybe_recompute_frontier`); empty when assistance is disabled.
+    pub frontier_weights: HashMap<StreamKey, f64>,
+    /// The number of lifted blocks at the last frontier recompute, used to throttle the
+    /// (relatively expensive) frontier attribution to coverage-growth events.
+    pub frontier_block_count: usize,
 }
 
 impl Fuzzer {
@@ -696,7 +703,41 @@ impl Fuzzer {
             phase_b,
             length_store: phase_b::LengthSampleStore::new(),
             phase_b_counter: 0,
+            frontier_weights: HashMap::new(),
+            frontier_block_count: 0,
         })
+    }
+
+    /// Recompute coverage-directed frontier weights if enough new blocks have been lifted
+    /// since the last computation.
+    ///
+    /// Identifies the true coverage frontier (conditional branches into not-yet-lifted
+    /// successors) and attributes each to the MMIO stream(s) controlling it via the Phase A
+    /// backward demand slice.  Throttled on lifted-block growth so the cost is amortised
+    /// across many executions; a no-op when mutation assistance is disabled (ablation arm).
+    pub fn maybe_recompute_frontier(&mut self) {
+        if !self.relation_graph.assist_enabled() {
+            if !self.frontier_weights.is_empty() {
+                self.frontier_weights.clear();
+            }
+            return;
+        }
+
+        /// Recompute only after at least this many new blocks have been lifted.
+        const FRONTIER_RECOMPUTE_DELTA: usize = 16;
+        let lifted = self.vm.code.blocks.len();
+        if self.frontier_block_count != 0 && lifted < self.frontier_block_count + FRONTIER_RECOMPUTE_DELTA
+        {
+            return;
+        }
+        self.frontier_block_count = lifted;
+
+        let weights = mmio_flow::compute_frontier_stream_weights(&self.vm.code, &self.mmio_flow);
+        tracing::debug!(
+            "frontier weights recomputed from {lifted} lifted blocks: {} gating stream(s)",
+            weights.len()
+        );
+        self.frontier_weights = weights;
     }
 
     /// Copies the currently selected input into `state`.

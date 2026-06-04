@@ -15,6 +15,38 @@ use crate::{
 /// Traversal depth when crossing function call boundaries.
 const MAX_CALL_LEVELS: usize = 3;
 
+/// Maximum additive multiplier applied to a stream that gates one or more uncovered
+/// frontier branches.  The boost saturates toward `1.0 + FRONTIER_BOOST` as the number
+/// of frontier branches a stream gates grows.
+const FRONTIER_BOOST: f64 = 3.0;
+
+/// Upper bound on the number of frontier branches processed in a single recompute,
+/// keeping the per-recompute overhead controllable on large firmware.
+const MAX_FRONTIER_BRANCHES: usize = 512;
+
+/// Knobs controlling a single backward CFG traversal.  Two call modes are supported:
+///
+///   * **Data-seed mode** (Phase A `candidates_for_new_stream`): the slice is pre-seeded
+///     from B's load-address varnode; the *start* block's own branch fires after B and
+///     therefore must NOT gate B (`inject_start_control = false`), while *predecessor*
+///     branch conditions DO gate the path to B (`inject_pred_control = true`).  A PC
+///     cutoff hides instructions after B's load in the start block.
+///   * **Branch-seed mode** (`candidates_for_branch`): the slice starts empty and the
+///     *start* block's own branch condition is the gate of interest
+///     (`inject_start_control = true`); predecessor branches gate already-covered code
+///     and are deliberately excluded (`inject_pred_control = false`) to keep the
+///     attribution focused on the single frontier branch.  No cutoff (the whole block
+///     precedes its terminating branch).
+struct TraverseCfg {
+    /// PC cutoff applied only to the start block (instructions strictly after this PC are
+    /// ignored).  `None` disables the cutoff.
+    start_cutoff: Option<u64>,
+    /// Whether the start block injects its own branch condition into the control channel.
+    inject_start_control: bool,
+    /// Whether predecessor blocks inject their branch conditions into the control channel.
+    inject_pred_control: bool,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // DemandSlice
 // ──────────────────────────────────────────────────────────────────────────────
@@ -412,8 +444,14 @@ impl MmioFlowAnalyzer {
         let reverse_cfg = build_reverse_cfg(code);
 
         // Backward CFG traversal: intra-function (depth=0) + inter-function up to
-        // `max_call_levels` call-stack levels.
-        self.backward_traverse(code, &reverse_cfg, block.start, readwatch_pc, &mut slice, 0);
+        // `max_call_levels` call-stack levels.  Data-seed mode: the start block's own
+        // branch fires after B (no self-gating); predecessor branches gate the path to B.
+        let cfg = TraverseCfg {
+            start_cutoff: Some(readwatch_pc),
+            inject_start_control: false,
+            inject_pred_control: true,
+        };
+        self.backward_traverse(code, &reverse_cfg, block.start, &cfg, &mut slice, 0);
 
         if dbg {
             eprintln!("[flow] RAW sources_addr={:?}", slice.sources_addr);
@@ -442,7 +480,7 @@ impl MmioFlowAnalyzer {
         code: &BlockTable,
         reverse_cfg: &ReverseCfg,
         start_addr: u64,
-        readwatch_pc: u64,
+        cfg: &TraverseCfg,
         slice: &mut DemandSlice,
         call_depth: usize,
     ) {
@@ -466,14 +504,16 @@ impl MmioFlowAnalyzer {
                 continue;
             };
 
-            // The block containing B (start_addr) must not inject its own branch condition as
-            // a control dependency (that branch fires after B).  Predecessor blocks do.
-            let inject_control = addr != start_addr;
+            // Whether this block injects its branch condition into the control channel
+            // depends on the traversal mode (see `TraverseCfg`): the start block follows
+            // `inject_start_control`, every predecessor follows `inject_pred_control`.
+            let inject_control =
+                if addr == start_addr { cfg.inject_start_control } else { cfg.inject_pred_control };
 
-            // Only the block that contains B applies the post-B instruction cutoff: within
-            // that block, instructions after readwatch_pc execute after B's read and must be
-            // ignored.  Predecessor blocks execute entirely before B, so no cutoff applies.
-            let cutoff_pc = if addr == start_addr { Some(readwatch_pc) } else { None };
+            // The PC cutoff applies only to the start block (it hides instructions after B's
+            // load in data-seed mode).  Predecessor blocks execute entirely before the start
+            // block, so no cutoff applies to them.
+            let cutoff_pc = if addr == start_addr { cfg.start_cutoff } else { None };
 
             if std::env::var_os("DUMP_FLOW").is_some() {
                 eprintln!(
@@ -514,6 +554,123 @@ impl MmioFlowAnalyzer {
             }
         }
     }
+
+    /// Find all MMIO stream addresses whose runtime value controls the conditional branch
+    /// that terminates the block starting at `branch_block_start`.
+    ///
+    /// This is the dual of [`candidates_for_new_stream`]: instead of asking "what governs
+    /// the access to stream B", it asks "what governs the *branch into an uncovered block*".
+    /// The branch condition is seeded directly into the control channel and traced backward
+    /// to the MMIO read(s) that compute it — reusing the same demand-slice machinery.
+    ///
+    /// Returns the deduplicated set of source stream keys (addresses).  Empty when the block
+    /// is not a conditional branch or no MMIO read feeds its condition.
+    ///
+    /// Single-shot entry point (builds the reverse CFG itself).  The batch frontier
+    /// computation uses [`candidates_for_branch_with_cfg`] with a shared reverse CFG.
+    #[allow(dead_code)]
+    pub fn candidates_for_branch(&self, branch_block_start: u64, code: &BlockTable) -> Vec<StreamKey> {
+        let reverse_cfg = build_reverse_cfg(code);
+        self.candidates_for_branch_with_cfg(branch_block_start, code, &reverse_cfg)
+    }
+
+    /// Like [`candidates_for_branch`] but reuses a pre-built reverse CFG, so a batch
+    /// computation over many frontier branches builds the reverse CFG only once.
+    fn candidates_for_branch_with_cfg(
+        &self,
+        branch_block_start: u64,
+        code: &BlockTable,
+        reverse_cfg: &ReverseCfg,
+    ) -> Vec<StreamKey> {
+        let Some(block) = find_block_containing(code, branch_block_start) else {
+            return vec![];
+        };
+        // Only conditional branches have a gating condition to attribute.
+        if block.exit.cond().is_none() {
+            return vec![];
+        }
+
+        // Branch-seed mode: the start block injects its OWN branch condition; predecessor
+        // branches gate already-covered code and are excluded to keep the attribution sharp.
+        let cfg = TraverseCfg {
+            start_cutoff: None,
+            inject_start_control: true,
+            inject_pred_control: false,
+        };
+        let mut slice = DemandSlice::default();
+        self.backward_traverse(code, reverse_cfg, block.start, &cfg, &mut slice, 0);
+
+        let mut keys: Vec<StreamKey> = slice.sources_ctrl.into_iter().map(|c| c.addr).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+}
+
+/// Resolve a block-exit `Target` to a concrete block-start address, if it is a direct
+/// (constant or internal) edge.  Indirect (register) targets return `None`.
+fn target_addr(target: &Target, code: &BlockTable) -> Option<u64> {
+    match target {
+        Target::External(Value::Const(addr, _)) => Some(*addr),
+        Target::Internal(idx) => code.blocks.get(*idx).map(|b| b.start),
+        _ => None,
+    }
+}
+
+/// Compute coverage-directed stream weights from the **true coverage frontier**.
+///
+/// A *frontier branch* is a conditional branch in an already-reached block (every block in
+/// `code.blocks` has been lifted, i.e. executed) that has at least one *direct successor
+/// address with no lifted block* — a branch target the fuzzer has never taken.  For each
+/// such branch we trace, via the Phase A backward demand slice, the MMIO stream(s) whose
+/// value controls it.  Streams gating more frontier branches receive a larger boost.
+///
+/// The returned map (`stream key → weight ≥ 1.0`) is superimposed onto the existing stream
+/// weights in `get_stream_weights`, focusing mutation energy precisely on the flows that
+/// gate genuinely uncovered code, rather than on a coarse "rare stream" proxy.
+///
+/// Overhead is bounded: the reverse CFG is built once, and at most `MAX_FRONTIER_BRANCHES`
+/// branches are attributed per call.  Intended to be invoked periodically (throttled on
+/// coverage growth), not per-execution.
+pub fn compute_frontier_stream_weights(
+    code: &BlockTable,
+    mmio_flow: &MmioFlowAnalyzer,
+) -> HashMap<StreamKey, f64> {
+    // The set of reached block-start addresses (every lifted block has been executed).
+    let reached: HashSet<u64> = code.blocks.iter().map(|b| b.start).collect();
+    let reverse_cfg = build_reverse_cfg(code);
+
+    let mut counts: HashMap<StreamKey, u32> = HashMap::new();
+    let mut processed = 0usize;
+    for block in &code.blocks {
+        if processed >= MAX_FRONTIER_BRANCHES {
+            break;
+        }
+        // Only conditional branches can gate entry into an uncovered successor.
+        if block.exit.cond().is_none() {
+            continue;
+        }
+        // Is at least one direct successor uncovered (no lifted block at its address)?
+        let is_frontier = block.exit.targets().any(|t| {
+            target_addr(&t, code).map_or(false, |addr| !reached.contains(&addr))
+        });
+        if !is_frontier {
+            continue;
+        }
+        processed += 1;
+
+        for key in mmio_flow.candidates_for_branch_with_cfg(block.start, code, &reverse_cfg) {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    // Convert frontier-branch counts to a saturating boost factor: 1 frontier branch already
+    // yields a strong boost, additional ones increase it with diminishing returns toward the
+    // ceiling `1.0 + FRONTIER_BOOST`.
+    counts
+        .into_iter()
+        .map(|(k, n)| (k, 1.0 + FRONTIER_BOOST * (1.0 - 1.0 / (1.0 + n as f64))))
+        .collect()
 }
 
 /// Seed the demand slice from the LOAD instruction at exactly `pc` inside `block`.
@@ -913,6 +1070,122 @@ mod tests {
             "MMIO load feeding the branch condition must be recorded as a Control source; \
              got sources_ctrl={:?}",
             slice.sources_ctrl
+        );
+    }
+
+    /// Build a `BlockTable` from a list of lifter blocks (for frontier tests).
+    fn block_table(blocks: Vec<Block>) -> BlockTable {
+        let mut code = BlockTable::default();
+        code.blocks = blocks;
+        code
+    }
+
+    /// A conditional branch block whose condition is computed from an MMIO read.
+    /// `start`/`end` bound the block; `target`/`fallthrough` are the two successor
+    /// addresses; the MMIO read site is registered under `stream` at `start`.
+    fn mmio_branch_block(
+        start: u64,
+        end: u64,
+        target: u64,
+        fallthrough: u64,
+    ) -> Block {
+        let mut pcode = pcode::Block::new();
+        let r1 = VarNode::new(1, 4);
+        let tmp_cmp = VarNode::new(-2, 1);
+        let mmio_base = VarNode::new(9, 4);
+
+        pcode.push(marker(start));
+        pcode.push((r1, pcode::Op::Load(0), mmio_base)); // MMIO load @start
+        pcode.push((tmp_cmp, pcode::Op::IntEqual, r1, pcode::Value::Const(3, 4)));
+
+        let mut block = lifter_block(pcode, start, end);
+        block.exit = BlockExit::Branch {
+            target: Target::External(pcode::Value::Const(target, 4)),
+            fallthrough: Target::External(pcode::Value::Const(fallthrough, 4)),
+            cond: pcode::Value::Var(tmp_cmp),
+        };
+        block
+    }
+
+    /// `candidates_for_branch` must trace a frontier branch back to the MMIO stream
+    /// whose value computes its condition — the dual of `candidates_for_new_stream`.
+    #[test]
+    fn candidates_for_branch_traces_gating_mmio() {
+        let stream = 0x5800_0010u64;
+        let block = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+        let code = block_table(vec![block]);
+
+        let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+        analyzer.record_read_site(0x700, stream); // the load @0x700 reads `stream`
+
+        let keys = analyzer.candidates_for_branch(0x700, &code);
+        assert_eq!(
+            keys,
+            vec![stream],
+            "branch condition gated on an MMIO read must attribute to that stream; got {keys:?}"
+        );
+    }
+
+    /// A block with no conditional branch (unconditional jump) has no gating condition,
+    /// so `candidates_for_branch` returns nothing.
+    #[test]
+    fn candidates_for_branch_empty_for_unconditional_block() {
+        let mut pcode = pcode::Block::new();
+        pcode.push(marker(0x800));
+        pcode.push((VarNode::new(1, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut block = lifter_block(pcode, 0x800, 0x804);
+        block.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x820, 4)) };
+        let code = block_table(vec![block]);
+
+        let analyzer = MmioFlowAnalyzer::new(vec![]);
+        assert!(analyzer.candidates_for_branch(0x800, &code).is_empty());
+    }
+
+    /// `compute_frontier_stream_weights` boosts a stream that gates an *uncovered* branch
+    /// target (no lifted block at the target address), and leaves the stream un-boosted once
+    /// every successor is covered.
+    #[test]
+    fn frontier_weights_boost_gating_stream_only_when_target_uncovered() {
+        let stream = 0x5800_0010u64;
+
+        // Branch @0x700 → 0xDEAD (UNCOVERED: no block at 0xDEAD) / 0x720 (covered).
+        let branch = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+        // A covered fallthrough block so 0x720 IS reached.
+        let mut fall_pcode = pcode::Block::new();
+        fall_pcode.push(marker(0x720));
+        fall_pcode.push((VarNode::new(2, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut fall = lifter_block(fall_pcode, 0x720, 0x724);
+        fall.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+
+        let code = block_table(vec![branch, fall]);
+        let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+        analyzer.record_read_site(0x700, stream);
+
+        let weights = compute_frontier_stream_weights(&code, &analyzer);
+        assert!(
+            weights.get(&stream).copied().unwrap_or(1.0) > 1.0,
+            "stream gating an uncovered branch target must be boosted; got {weights:?}"
+        );
+
+        // Now mark 0xDEAD as covered by adding a block there: no frontier remains.
+        let mut deads = pcode::Block::new();
+        deads.push(marker(0xDEAD));
+        deads.push((VarNode::new(3, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut dead_block = lifter_block(deads, 0xDEAD, 0xDEB1);
+        dead_block.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+
+        let branch2 = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+        let mut fall2_pcode = pcode::Block::new();
+        fall2_pcode.push(marker(0x720));
+        fall2_pcode.push((VarNode::new(2, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut fall2 = lifter_block(fall2_pcode, 0x720, 0x724);
+        fall2.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+
+        let code_covered = block_table(vec![branch2, fall2, dead_block]);
+        let weights_covered = compute_frontier_stream_weights(&code_covered, &analyzer);
+        assert!(
+            weights_covered.get(&stream).is_none(),
+            "no boost once every branch target is covered; got {weights_covered:?}"
         );
     }
 }

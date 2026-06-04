@@ -32,16 +32,6 @@ const OVERFLOW_PROBE_PROB: f64 = 0.15;
 /// configured the governed target) instead of a random mutation.
 const SPLICE_PROB: f64 = 0.10;
 
-/// Governs how quickly the frontier boost saturates.  A governor of a target
-/// with `FRONTIER_SATURATION` corpus inputs receives half the maximum boost;
-/// targets with fewer inputs receive a stronger boost.
-const FRONTIER_SATURATION: f64 = 5.0;
-
-/// Maximum additive multiplier applied to streams that govern underexplored
-/// targets.  At saturation = 0 inputs the weight is multiplied by
-/// `1.0 + FRONTIER_BOOST`; the boost decays toward 1.0 as coverage grows.
-const FRONTIER_BOOST: f64 = 3.0;
-
 // ──────────────────────────────────────────────────────────────────────────────
 // HavocStage
 // ──────────────────────────────────────────────────────────────────────────────
@@ -75,6 +65,11 @@ pub(crate) struct HavocStage {
 
 impl StageData for HavocStage {
     fn start(fuzzer: &mut Fuzzer) -> Result<Self, StageExit> {
+        // Refresh coverage-directed frontier weights (throttled on coverage growth) before
+        // building the stream-selection distribution, so mutation energy is steered toward
+        // the MMIO flows gating genuinely uncovered code.
+        fuzzer.maybe_recompute_frontier();
+
         fuzzer.copy_current_input();
 
         let (Some(id), data) = (fuzzer.input_id, &fuzzer.state.input)
@@ -89,17 +84,12 @@ impl StageData for HavocStage {
 
         let (coupled, length_rel) = build_coupling(&fuzzer.relation_graph, &streams);
 
-        // Coverage-directed frontier weights: governors of underexplored targets
-        // are sampled more often to guide mutation toward unlocking new coverage.
-        let reach_counts: HashMap<StreamKey, usize> = fuzzer
-            .corpus
-            .metadata
-            .streams
+        // Project the precomputed frontier weights onto this input's streams (parallel to
+        // `streams`): a stream that gates an uncovered frontier branch is mutated more often.
+        let frontier_boosts: Vec<f64> = streams
             .iter()
-            .map(|(k, m)| (*k, m.num_inputs))
+            .map(|(key, _)| fuzzer.frontier_weights.get(key).copied().unwrap_or(1.0))
             .collect();
-        let frontier_weights =
-            compute_frontier_weights(&fuzzer.relation_graph, &streams, &reach_counts);
 
         // Prefix-splice candidates: corpus entries where a governed target is
         // non-empty → the governor stream bytes from that entry are candidate
@@ -107,7 +97,7 @@ impl StageData for HavocStage {
         let splice_candidates =
             collect_splice_candidates(&fuzzer.relation_graph, &streams, &fuzzer.corpus);
 
-        let stream_distr = get_stream_weights(fuzzer, id, &streams, &frontier_weights);
+        let stream_distr = get_stream_weights(fuzzer, id, &streams, &frontier_boosts);
         let mutator = HavocMutator::new();
         let attempts = calculate_energy(fuzzer) as u32;
         let log2_max_mutations = log2_max_mutations(fuzzer);
@@ -120,7 +110,7 @@ impl StageData for HavocStage {
              ({} splice candidates, {} frontier-boosted streams)",
             2_u64.pow(log2_max_mutations),
             splice_candidates.values().map(|v| v.len()).sum::<usize>(),
-            frontier_weights.iter().filter(|&&w| w > 1.5).count(),
+            frontier_boosts.iter().filter(|&&w| w > 1.5).count(),
         );
         Ok(Self {
             attempts,
@@ -541,38 +531,6 @@ fn build_coupling(
     (coupled, length_rel)
 }
 
-/// Compute coverage-directed frontier boost weights (parallel to `streams`).
-///
-/// A stream A that governs a rarely-reached target B receives a weight > 1.0 so
-/// the mutation scheduler selects it more often when coverage is thin around B.
-/// The boost decays smoothly toward 1.0 as `B.num_inputs` grows past
-/// `FRONTIER_SATURATION`, so the bias is strongest at the start of fuzzing and
-/// diminishes once B is well-explored.
-///
-/// Formula: `weight[A] = 1.0 + FRONTIER_BOOST * max_B(FRONTIER_SATURATION / (FRONTIER_SATURATION + reach(B)))`
-fn compute_frontier_weights(
-    graph: &StreamRelationGraph,
-    streams: &[(StreamKey, usize)],
-    reach_counts: &HashMap<StreamKey, usize>,
-) -> Vec<f64> {
-    streams
-        .iter()
-        .map(|(key, _)| {
-            if !graph.assist_enabled() {
-                return 1.0;
-            }
-            let max_frontier = graph
-                .dependents(*key)
-                .map(|edge| {
-                    let reach = reach_counts.get(&edge.target.addr).copied().unwrap_or(0) as f64;
-                    FRONTIER_SATURATION / (FRONTIER_SATURATION + reach)
-                })
-                .fold(0.0_f64, f64::max);
-            1.0 + FRONTIER_BOOST * max_frontier
-        })
-        .collect()
-}
-
 /// Collect per-stream splice candidates from the corpus.
 ///
 /// For each Control or Address edge A→B in the graph (restricted to present streams),
@@ -687,20 +645,6 @@ mod tests {
         AccessContext::new(pc, addr)
     }
 
-    fn graph_with_edge(
-        src: StreamKey,
-        tgt: StreamKey,
-        kind: EdgeKind,
-        confirmed: bool,
-    ) -> StreamRelationGraph {
-        let mut g = StreamRelationGraph::new();
-        g.add_structural_candidates(ac(0x20, tgt), &[(ac(0x10, src), kind)]);
-        if confirmed {
-            g.confirm_edge(ac(0x10, src), ac(0x20, tgt), kind, None);
-        }
-        g
-    }
-
     // ── build_coupling ────────────────────────────────────────────────────────
 
     /// Coupling links a confirmed dependency both ways and surfaces the fitted
@@ -748,60 +692,6 @@ mod tests {
 
         let (coupled, length_rel) = build_coupling(&graph, &[(a, 4), (b, 4)]);
         assert!(coupled.is_empty() && length_rel.is_empty());
-    }
-
-    // ── compute_frontier_weights ──────────────────────────────────────────────
-
-    /// A governor of an unexplored target (0 corpus inputs) must receive the
-    /// maximum frontier boost.  A governor of a well-explored target must receive
-    /// approximately 1.0 (no significant boost).
-    #[test]
-    fn frontier_boost_elevates_governor_of_rare_target() {
-        let a = 0x5800_0000u64;
-        let b = 0x5800_0004u64;
-        let streams = vec![(a, 4usize), (b, 4usize)];
-        let graph = graph_with_edge(a, b, EdgeKind::Control, false);
-
-        // B has never been reached.
-        let reach_zero: HashMap<StreamKey, usize> = HashMap::from_iter([(b, 0)]);
-        let weights_zero = compute_frontier_weights(&graph, &streams, &reach_zero);
-        let a_idx = streams.iter().position(|(k, _)| *k == a).unwrap();
-        let b_idx = streams.iter().position(|(k, _)| *k == b).unwrap();
-        // A governs B → strong boost expected.
-        assert!(
-            weights_zero[a_idx] > 2.0,
-            "governor of unexplored target should be boosted; got {:.2}",
-            weights_zero[a_idx]
-        );
-        // B has no out-edges so no boost for B.
-        assert!(
-            (weights_zero[b_idx] - 1.0).abs() < 1e-9,
-            "non-governor should have weight 1.0; got {:.2}",
-            weights_zero[b_idx]
-        );
-
-        // B is well-explored (100 corpus inputs → strong saturation).
-        let reach_full: HashMap<StreamKey, usize> = HashMap::from_iter([(b, 100)]);
-        let weights_full = compute_frontier_weights(&graph, &streams, &reach_full);
-        assert!(
-            weights_full[a_idx] < weights_zero[a_idx],
-            "boost must decay as target coverage grows"
-        );
-    }
-
-    /// When assist is disabled, frontier weights must all be 1.0.
-    #[test]
-    fn frontier_weights_all_one_when_assist_disabled() {
-        let a = 0x5800_0000u64;
-        let b = 0x5800_0004u64;
-        let mut graph = StreamRelationGraph::new();
-        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
-        graph.set_assist_enabled(false);
-
-        let streams = vec![(a, 4usize), (b, 4usize)];
-        let reach: HashMap<StreamKey, usize> = HashMap::from_iter([(b, 0)]);
-        let weights = compute_frontier_weights(&graph, &streams, &reach);
-        assert!(weights.iter().all(|&w| (w - 1.0).abs() < 1e-9));
     }
 
     // ── collect_splice_candidates ─────────────────────────────────────────────
