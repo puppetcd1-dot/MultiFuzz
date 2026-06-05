@@ -500,8 +500,14 @@ pub fn apply_pass_result(
                 None => None,
             };
             graph.confirm_edge(obs.source, obs.target, EdgeKind::Length, relation);
-        } else {
-            graph.confirm_edge(obs.source, obs.target, EdgeKind::Control, None);
+        } else if graph.confirm_edge(obs.source, obs.target, EdgeKind::Control, None) {
+            // Capture the gating source value so the mutator can inject it directly
+            // to open the path to the target.  Only recorded when the Control edge
+            // was structurally backed (confirm_edge returned true); an unbacked
+            // observation is a taint over-approximation and is dropped along with it.
+            if let Some((val, _count)) = obs.sample {
+                graph.record_discriminant(obs.source.addr, obs.target.addr, val);
+            }
         }
     }
 }
@@ -832,6 +838,61 @@ mod tests {
         assert_eq!(edge.kind, EdgeKind::Length);
         assert_eq!(edge.confidence, Confidence::TaintConfirmed);
         assert!(edge.relation.is_some(), "a relation should be fitted from the samples");
+    }
+
+    /// A confirmed (non-looping) Control edge captures the gating source value as a
+    /// discriminant, so the mutator can later inject it to unlock the target.
+    #[test]
+    fn apply_results_captures_control_discriminant() {
+        let mut graph = StreamRelationGraph::new();
+        let mut store = LengthSampleStore::new();
+
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        graph.add_structural_candidates(tgt, &[(src, EdgeKind::Control)]);
+
+        // Two passes observe distinct gating values (3, then 5) on a non-loop Control edge.
+        for v in [3u64, 5u64] {
+            let result = PassResult {
+                address_edges: vec![],
+                control_edges: vec![ControlEdgeObs {
+                    source: src,
+                    target: tgt,
+                    is_length: false,
+                    sample: Some((v, 1)),
+                }],
+            };
+            apply_pass_result(&mut graph, &mut store, result);
+        }
+
+        let edge = graph
+            .confirmed_edges()
+            .find(|e| e.source == src && e.target == tgt)
+            .expect("Control edge should be confirmed");
+        assert_eq!(edge.kind, EdgeKind::Control);
+        assert_eq!(edge.value_set, vec![3, 5], "both gating values captured as discriminants");
+    }
+
+    /// An unbacked Control observation is dropped (no edge invented) AND records no
+    /// discriminant — the regression guard against spurious value injection.
+    #[test]
+    fn apply_results_no_discriminant_without_structural_backing() {
+        let mut graph = StreamRelationGraph::new();
+        let mut store = LengthSampleStore::new();
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        // No structural candidate added → confirm_edge must fail and nothing recorded.
+        let result = PassResult {
+            address_edges: vec![],
+            control_edges: vec![ControlEdgeObs {
+                source: src,
+                target: tgt,
+                is_length: false,
+                sample: Some((9, 1)),
+            }],
+        };
+        apply_pass_result(&mut graph, &mut store, result);
+        assert_eq!(graph.edge_count(), 0, "unbacked observation invents no edge");
     }
 
     /// When the MMIO read value is suppressed at load time (production `LiveEnv`),

@@ -137,6 +137,11 @@ pub struct StreamEdge {
     pub confidence: Confidence,
     /// Populated for confirmed Length edges: maps val_A → expected count_B.
     pub relation:   Option<Relation>,
+    /// Discriminating source values for a `Control` edge: concrete values of the
+    /// source stream observed (in Phase B) to open the path to the target.  The
+    /// mutator injects these directly so it does not have to rediscover the gating
+    /// value by random search — the key to unlocking command-dispatch peripherals.
+    pub value_set:  Vec<u64>,
 }
 
 /// Directed graph of structural and taint-confirmed relationships between MMIO streams.
@@ -186,6 +191,7 @@ impl StreamRelationGraph {
                 kind,
                 confidence: Confidence::Structural,
                 relation: None,
+                value_set: Vec::new(),
             });
             self.outgoing.entry(source.addr).or_default().push(idx);
             self.incoming.entry(target.addr).or_default().push(idx);
@@ -251,6 +257,33 @@ impl StreamRelationGraph {
             }
         }
         upgraded
+    }
+
+    /// Record a discriminating source value on confirmed `Control` edge(s)
+    /// `source → target`.
+    ///
+    /// `value` is a concrete value of the source stream that Phase B observed to
+    /// open the path to the target.  Accumulating these across taint passes builds
+    /// the set of known-gating values the mutator can inject directly.  The set is
+    /// bounded so a noisy source (e.g. a counter feeding a comparison) cannot grow
+    /// it without limit.  Only `Control` edges carry discriminants: `Length` edges
+    /// already model the value→count mapping via `relation`, and `Address` edges
+    /// consume the value as an address rather than a discriminator.
+    pub fn record_discriminant(&mut self, source: StreamKey, target: StreamKey, value: u64) {
+        const MAX_DISCRIMINANTS: usize = 16;
+        let Some(indices) = self.incoming.get(&target).cloned() else {
+            return;
+        };
+        for idx in indices {
+            let edge = &mut self.edges[idx];
+            if edge.source.addr == source
+                && edge.kind == EdgeKind::Control
+                && edge.value_set.len() < MAX_DISCRIMINANTS
+                && !edge.value_set.contains(&value)
+            {
+                edge.value_set.push(value);
+            }
+        }
     }
 
     /// True if an edge with this exact context pair already exists.
@@ -327,12 +360,19 @@ impl StreamRelationGraph {
                 Some(r) => format!("{:?}", r.kind),
                 None => "none".to_string(),
             };
+            let values = e
+                .value_set
+                .iter()
+                .map(|v| format!("\"{v:#x}\""))
+                .collect::<Vec<_>>()
+                .join(",");
             s.push_str(&format!(
                 "  {{\"source_pc\":\"{:#x}\",\"source_addr\":\"{:#x}\",\
                  \"target_pc\":\"{:#x}\",\"target_addr\":\"{:#x}\",\
-                 \"kind\":\"{:?}\",\"confidence\":\"{:?}\",\"relation\":\"{}\"}}",
+                 \"kind\":\"{:?}\",\"confidence\":\"{:?}\",\"relation\":\"{}\",\
+                 \"values\":[{}]}}",
                 e.source.pc, e.source.addr, e.target.pc, e.target.addr,
-                e.kind, e.confidence, relation
+                e.kind, e.confidence, relation, values
             ));
         }
         s.push_str("\n]\n");
@@ -416,6 +456,45 @@ mod tests {
         assert_eq!(g.edge_count(), 1, "confirmation upgrades in place, never adds a row");
         assert_eq!(g.confidence_of(0x5800_0000, 0x5800_0004), Some(Confidence::TaintConfirmed));
         assert_eq!(g.governors(0x5800_0004).next().unwrap().kind, EdgeKind::Length);
+    }
+
+    /// Discriminating values accumulate on a confirmed Control edge, dedup, stay
+    /// bounded, and are never attached to a non-Control edge.
+    #[test]
+    fn record_discriminant_accumulates_bounded_unique_values() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+        g.confirm_edge(a, b, EdgeKind::Control, None);
+
+        // Distinct values accumulate; duplicates are ignored.
+        g.record_discriminant(a.addr, b.addr, 3);
+        g.record_discriminant(a.addr, b.addr, 3);
+        g.record_discriminant(a.addr, b.addr, 7);
+        let edge = g.governors(b.addr).next().unwrap();
+        assert_eq!(edge.value_set, vec![3, 7], "dedup distinct gating values");
+
+        // The set is bounded (≤16): pushing many distinct values cannot grow it past the cap.
+        for v in 100..200 {
+            g.record_discriminant(a.addr, b.addr, v);
+        }
+        let edge = g.governors(b.addr).next().unwrap();
+        assert!(edge.value_set.len() <= 16, "discriminant set must stay bounded");
+    }
+
+    /// A discriminant is only attached to `Control` edges — never `Length`/`Address`.
+    #[test]
+    fn record_discriminant_ignores_non_control_edges() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+        g.confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
+
+        g.record_discriminant(a.addr, b.addr, 42);
+        let edge = g.governors(b.addr).next().unwrap();
+        assert!(edge.value_set.is_empty(), "Length edge must not receive discriminants");
     }
 
     /// PC mismatch between Phase A and Phase B still confirms via the address pair,

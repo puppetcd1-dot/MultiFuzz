@@ -32,6 +32,13 @@ const OVERFLOW_PROBE_PROB: f64 = 0.15;
 /// configured the governed target) instead of a random mutation.
 const SPLICE_PROB: f64 = 0.10;
 
+/// Probability that a Control-source stream with known discriminating values has
+/// one injected (overwriting its leading word) instead of a random mutation.
+/// Discriminant injection sets the source to a concrete value Phase B observed to
+/// open the path to a governed target — the precise way to unlock command-dispatch
+/// peripherals that a gating value, not buffer shape, controls.
+const DISCRIMINANT_INJECT_PROB: f64 = 0.20;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // HavocStage
 // ──────────────────────────────────────────────────────────────────────────────
@@ -57,6 +64,11 @@ pub(crate) struct HavocStage {
     /// Splice mutation uses these to inject proven-working values for A so the
     /// execution starts from a configuration that previously unlocked B.
     splice_candidates: HashMap<StreamKey, Vec<Vec<u8>>>,
+    /// For each Control-source stream, the concrete gating values Phase B observed
+    /// to open the path to a governed target.  Injecting one sets the source to a
+    /// value known to discriminate the branch, unlocking targets that may not even
+    /// be present yet (the new-coverage case).
+    discriminants: HashMap<StreamKey, Vec<u64>>,
 
     log2_max_mutations: u32,
     max_mutations: u32,
@@ -97,6 +109,10 @@ impl StageData for HavocStage {
         let splice_candidates =
             collect_splice_candidates(&fuzzer.relation_graph, &streams, &fuzzer.corpus);
 
+        // Gating-value injection candidates: for each present Control source, the
+        // concrete values Phase B saw open the path to a governed target.
+        let discriminants = collect_discriminants(&fuzzer.relation_graph, &streams);
+
         let stream_distr = get_stream_weights(fuzzer, id, &streams, &frontier_boosts);
         let mutator = HavocMutator::new();
         let attempts = calculate_energy(fuzzer) as u32;
@@ -123,6 +139,7 @@ impl StageData for HavocStage {
             coupled,
             length_rel,
             splice_candidates,
+            discriminants,
             saved: false,
         })
     }
@@ -202,15 +219,24 @@ impl HavocStage {
             if let Some((target, rel)) = probe_target {
                 self.overflow_probe(fuzzer, key, target, &rel);
             } else {
-                // PREFIX SPLICE: if this stream has corpus-derived discriminating
-                // values (bytes that previously unlocked a governed target), inject
-                // them with SPLICE_PROB probability instead of random mutation.
-                // This drives the execution toward known-good configurations that
-                // unlock specific peripherals, rather than exploring blindly.
+                // DISCRIMINANT INJECTION: if this stream is a Control source with
+                // known gating values, set it to one of them (with
+                // DISCRIMINANT_INJECT_PROB) so the gated path opens — the precise
+                // unlock that random search rarely hits on a multi-way comparison.
+                let should_inject =
+                    self.discriminants.get(&key).map_or(false, |v| !v.is_empty())
+                        && fuzzer.rng.gen_bool(DISCRIMINANT_INJECT_PROB);
+                // PREFIX SPLICE: otherwise, if this stream has corpus-derived
+                // working bytes (that previously unlocked a governed target), inject
+                // them with SPLICE_PROB probability instead of random mutation, to
+                // drive execution toward known-good configurations rather than
+                // exploring blindly.
                 let should_splice =
                     self.splice_candidates.get(&key).map_or(false, |v| !v.is_empty())
                         && fuzzer.rng.gen_bool(SPLICE_PROB);
-                if should_splice {
+                if should_inject {
+                    self.inject_discriminant(fuzzer, key);
+                } else if should_splice {
                     self.splice_from_donor(fuzzer, key);
                 } else {
                     self.mutate_stream(fuzzer, key, num_mutations);
@@ -351,6 +377,31 @@ impl HavocStage {
             bytes.resize(splice_len, 0);
         }
         bytes[..splice_len].copy_from_slice(&donor[..splice_len]);
+    }
+
+    /// DISCRIMINANT INJECTION: overwrite the leading word of `key`'s stream with a
+    /// concrete gating value Phase B observed to open the path to a governed target.
+    ///
+    /// The value is written little-endian over `min(len, 4)` leading bytes — the
+    /// width a typical MMIO read consumes — so a narrow read sees the low byte(s)
+    /// and a word read sees the whole value.  No bytes beyond the first word are
+    /// touched, leaving any subsequent reads from the same stream intact.  The
+    /// stream is never created or grown here: an absent/empty source has nothing to
+    /// gate with, and growing it is the job of the normal extension path.
+    fn inject_discriminant(&mut self, fuzzer: &mut Fuzzer, key: StreamKey) {
+        let Some(values) = self.discriminants.get(&key) else { return };
+        if values.is_empty() {
+            return;
+        }
+        let value = values[fuzzer.rng.gen_range(0..values.len())];
+
+        let bytes = &mut fuzzer.state.input.streams.entry(key).or_default().bytes;
+        if bytes.is_empty() {
+            return;
+        }
+        let width = bytes.len().min(4);
+        let le = value.to_le_bytes();
+        bytes[..width].copy_from_slice(&le[..width]);
     }
 
     #[allow(unused)]
@@ -598,6 +649,36 @@ fn collect_splice_candidates(
     candidates
 }
 
+/// Collect per-stream discriminating values from the relation graph.
+///
+/// For each present stream that is the source of a confirmed `Control` edge, gather
+/// the gating values Phase B recorded on that edge.  Unlike splice candidates, the
+/// governed target need NOT be present: the whole point is to inject a gating value
+/// that may unlock a target the current input has not yet reached (new coverage).
+fn collect_discriminants(
+    graph: &StreamRelationGraph,
+    streams: &[(StreamKey, usize)],
+) -> HashMap<StreamKey, Vec<u64>> {
+    let mut map: HashMap<StreamKey, Vec<u64>> = HashMap::new();
+    if !graph.assist_enabled() {
+        return map;
+    }
+    for &(key, _) in streams {
+        for edge in graph.dependents(key) {
+            if edge.kind != EdgeKind::Control || edge.value_set.is_empty() {
+                continue;
+            }
+            let list = map.entry(key).or_default();
+            for &v in &edge.value_set {
+                if !list.contains(&v) {
+                    list.push(v);
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Boundary byte-counts to probe for a target stream of `current_len` bytes.
 ///
 /// Covers: underflow (0, 1, 2), common powers-of-two, large-value overflows,
@@ -768,6 +849,61 @@ mod tests {
         let corpus = make_corpus_with_entry(a, vec![0x01], b, vec![0xAA]);
         let candidates = collect_splice_candidates(&graph, &[(a, 1), (b, 1)], &corpus);
         assert!(candidates.is_empty());
+    }
+
+    // ── collect_discriminants ─────────────────────────────────────────────────
+
+    /// Gating values recorded on a confirmed Control edge are surfaced for the
+    /// source stream even when the governed target is absent (the unlock case).
+    #[test]
+    fn discriminants_collected_for_control_source_even_if_target_absent() {
+        let a = 0x5800_0000u64;
+        let b = 0x5800_0004u64;
+
+        let mut graph = StreamRelationGraph::new();
+        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
+        graph.confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Control, None);
+        graph.record_discriminant(a, b, 3);
+        graph.record_discriminant(a, b, 7);
+
+        // Only A is present; B (the target) is NOT in the input.
+        let streams = vec![(a, 4usize)];
+        let map = collect_discriminants(&graph, &streams);
+
+        assert_eq!(
+            map.get(&a).map(|v| v.as_slice()),
+            Some([3u64, 7u64].as_slice()),
+            "Control source surfaces its gating values regardless of target presence"
+        );
+    }
+
+    /// Length and Address edges contribute no discriminants, and an assist-disabled
+    /// graph yields none at all (ablation arm).
+    #[test]
+    fn discriminants_excludes_non_control_and_respects_assist() {
+        let a = 0x5800_0000u64;
+        let b = 0x5800_0004u64;
+
+        let mut graph = StreamRelationGraph::new();
+        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
+        // Reclassify to Length: a discriminant recorded now must be ignored.
+        graph.confirm_edge(
+            ac(0x10, a),
+            ac(0x20, b),
+            EdgeKind::Length,
+            Some(Relation { kind: RelKind::Identity }),
+        );
+        graph.record_discriminant(a, b, 5);
+        assert!(
+            collect_discriminants(&graph, &[(a, 4)]).is_empty(),
+            "Length edge contributes no discriminants"
+        );
+
+        graph.set_assist_enabled(false);
+        assert!(
+            collect_discriminants(&graph, &[(a, 4)]).is_empty(),
+            "assist disabled yields no discriminants"
+        );
     }
 
     // ── boundary_counts ───────────────────────────────────────────────────────
