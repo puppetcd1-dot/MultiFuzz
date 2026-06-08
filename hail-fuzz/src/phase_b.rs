@@ -711,15 +711,12 @@ mod tests {
     use icicle_vm::cpu::lifter::{Block, BlockExit, Target};
     use pcode::VarNode;
 
-    /// Mock concrete environment: a register map + a flat memory map.
     struct MockEnv {
         regs: HashMap<i16, u64>,
-        mem: HashMap<u64, u64>, // addr → value (size-agnostic for tests)
+        mem: HashMap<u64, u64>,
     }
     impl MockEnv {
-        fn new() -> Self {
-            Self { regs: HashMap::new(), mem: HashMap::new() }
-        }
+        fn new() -> Self { Self { regs: HashMap::new(), mem: HashMap::new() } }
     }
     impl ConcreteEnv for MockEnv {
         fn read_value(&mut self, v: Value) -> Option<u64> {
@@ -734,25 +731,12 @@ mod tests {
     }
 
     fn lifter_block(pcode: pcode::Block, start: u64, end: u64, exit: BlockExit) -> Block {
-        Block {
-            pcode,
-            entry: None,
-            start,
-            end,
-            context: 0,
-            exit,
-            breakpoints: 0,
-            num_instructions: 0,
-        }
+        Block { pcode, entry: None, start, end, context: 0, exit, breakpoints: 0, num_instructions: 0 }
     }
-
     fn marker(pc: u64) -> pcode::Instruction {
         (pcode::Op::InstructionMarker, pcode::Value::Const(pc, 8)).into()
     }
-    fn reg(id: i16) -> VarNode {
-        VarNode::new(id, 4)
-    }
-
+    fn reg(id: i16) -> VarNode { VarNode::new(id, 4) }
     fn engine() -> PhaseBEngine {
         PhaseBEngine::new(HashMap::new(), vec![0x4000_0000..0x6000_0000])
     }
@@ -761,12 +745,9 @@ mod tests {
     #[test]
     fn address_edge_confirmed_from_tainted_load_address() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0000); // source A
-        e.read_sites.insert(0x108, 0x5800_0004); // target B
+        e.read_sites.insert(0x100, 0x5800_0000);
+        e.read_sites.insert(0x108, 0x5800_0004);
 
-        // 0x100: r10 = LOAD[r5]        (MMIO A → r10 tainted by A)
-        // 0x104: r7  = ADD r4, r10     (B's address = base + A)
-        // 0x108: r1  = LOAD[r7]        (MMIO B; address tainted by A)
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
         p.push((reg(10), Op::Load(0), reg(5)));
@@ -785,21 +766,16 @@ mod tests {
 
         let src = AccessContext::new(0x100, 0x5800_0000);
         let tgt = AccessContext::new(0x108, 0x5800_0004);
-        assert!(
-            result.address_edges.contains(&(src, tgt)),
-            "expected Address edge A→B, got {:?}",
-            result.address_edges
-        );
+        assert!(result.address_edges.contains(&(src, tgt)), "expected Address edge A→B");
     }
 
-    /// A non-looping tainted branch gating B yields a `Control` edge (not `Length`).
+    /// A non-looping tainted equality branch gating B yields Control (not Length).
     #[test]
     fn control_edge_confirmed_from_tainted_branch() {
         let mut e = engine();
-        e.read_sites.insert(0x200, 0x5800_0008); // source A (gates branch)
-        e.read_sites.insert(0x300, 0x5800_0000); // target B
+        e.read_sites.insert(0x200, 0x5800_0008);
+        e.read_sites.insert(0x300, 0x5800_0000);
 
-        // Block 1 @0x200: r1 = LOAD[r9]; r2 = EQ(r1, #3); branch on r2.
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x200));
         p1.push((reg(1), Op::Load(0), reg(9)));
@@ -812,7 +788,6 @@ mod tests {
         };
         let b1 = lifter_block(p1, 0x200, 0x208, exit1);
 
-        // Block 2 @0x300: r5 = LOAD[r8]  (B)
         let mut p2 = pcode::Block::new();
         p2.push(marker(0x300));
         p2.push((reg(5), Op::Load(0), reg(8)));
@@ -829,18 +804,59 @@ mod tests {
         let src = AccessContext::new(0x200, 0x5800_0008);
         let tgt = AccessContext::new(0x300, 0x5800_0000);
         let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
-        assert!(edge.is_some(), "expected Control observation A→B, got {:?}", result.control_edges);
-        assert!(!edge.unwrap().is_length, "single activation must NOT be Length");
+        assert!(edge.is_some(), "expected Control observation A→B");
+        let edge = edge.unwrap();
+        assert!(!edge.is_length, "single activation must NOT be Length");
+        assert!(edge.is_eq, "IntEqual condition must set is_eq");
     }
 
-    /// A tainted loop branch under which B is read multiple times yields `Length`.
+    /// Fix 3: A range-check (IntLess) condition must NOT set is_eq.
     #[test]
-    fn length_edge_from_looping_tainted_branch() {
+    fn range_check_branch_does_not_set_is_eq() {
         let mut e = engine();
-        e.read_sites.insert(0x200, 0x5800_0008); // source A (loop bound)
-        e.read_sites.insert(0x300, 0x5800_0000); // target B (read each iteration)
+        e.read_sites.insert(0x200, 0x5800_0008);
+        e.read_sites.insert(0x300, 0x5800_0000);
 
-        // Loop header @0x200 (tainted branch). Re-evaluated each iteration → revisited.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        // IntLess, not IntEqual — range guard, not discriminant
+        p1.push((reg(2), Op::IntLess, reg(1), Value::Const(256, 4)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(5), Op::Load(0), reg(8)));
+        let b2 = lifter_block(p2, 0x300, 0x304, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+
+        e.run_block(&b1, &mut env);
+        e.run_block(&b2, &mut env);
+        let result = e.finish_pass();
+
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
+        assert!(edge.is_some());
+        assert!(!edge.unwrap().is_eq, "IntLess condition must NOT set is_eq");
+    }
+
+    /// Fix 5: A loop where B is read exactly 2 times must NOT be Length (needs ≥3).
+    #[test]
+    fn count_two_is_not_length() {
+        let mut e = engine();
+        e.read_sites.insert(0x200, 0x5800_0008);
+        e.read_sites.insert(0x300, 0x5800_0000);
+
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x200));
         p1.push((reg(1), Op::Load(0), reg(9)));
@@ -853,7 +869,6 @@ mod tests {
         };
         let b1 = lifter_block(p1, 0x200, 0x208, exit1);
 
-        // Loop body @0x300: reads B.
         let mut p2 = pcode::Block::new();
         p2.push(marker(0x300));
         p2.push((reg(5), Op::Load(0), reg(8)));
@@ -864,7 +879,49 @@ mod tests {
         env.regs.insert(8, 0x5800_0000);
         env.regs.insert(3, 0);
 
-        // Three iterations: header, body, header, body, header, body.
+        // Only 2 iterations → count=2, below the ≥3 threshold.
+        for _ in 0..2 {
+            e.run_block(&b1, &mut env);
+            e.run_block(&b2, &mut env);
+        }
+        let result = e.finish_pass();
+
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
+        assert!(edge.is_some());
+        assert!(!edge.unwrap().is_length, "count=2 must NOT be classified as Length");
+    }
+
+    /// A tainted loop branch (IntLess) where B is read ≥3 times yields `Length`.
+    #[test]
+    fn length_edge_from_looping_tainted_branch() {
+        let mut e = engine();
+        e.read_sites.insert(0x200, 0x5800_0008);
+        e.read_sites.insert(0x300, 0x5800_0000);
+
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntLess, reg(3), reg(1)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(5), Op::Load(0), reg(8)));
+        let b2 = lifter_block(p2, 0x300, 0x304, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+        env.regs.insert(3, 0);
+
         for _ in 0..3 {
             e.run_block(&b1, &mut env);
             e.run_block(&b2, &mut env);
@@ -878,11 +935,48 @@ mod tests {
             .iter()
             .find(|o| o.source == src && o.target == tgt)
             .expect("expected a control/length observation");
-        assert!(edge.is_length, "looping tainted branch with ≥2 reads must be Length");
+        assert!(edge.is_length, "looping tainted branch with ≥3 reads must be Length");
     }
 
-    /// `apply_pass_result` upgrades a structural Control candidate to a taint-confirmed
-    /// Address edge, and fits a Length relation across repeated samples.
+    /// Fix 6: apply_pass_result pools Length samples at address granularity —
+    /// two different source PCs for the same addr pair contribute to one fit.
+    #[test]
+    fn length_samples_pool_at_address_granularity() {
+        let mut graph = StreamRelationGraph::new();
+        let mut store = LengthSampleStore::new();
+
+        let src_a = AccessContext::new(0x100, 0x5800_0008); // PC 0x100
+        let src_b = AccessContext::new(0x200, 0x5800_0008); // same addr, different PC
+        let tgt   = AccessContext::new(0x300, 0x5800_0000);
+
+        graph.add_structural_candidates(tgt, &[(src_a, EdgeKind::Control)]);
+
+        // Pass 1: sample from PC 0x100 → (4, 4)
+        apply_pass_result(&mut graph, &mut store, PassResult {
+            address_edges: vec![],
+            control_edges: vec![ControlEdgeObs {
+                source: src_a, target: tgt, is_length: true, is_eq: false,
+                sample: Some((4, 4)),
+            }],
+        });
+        // Pass 2: sample from PC 0x200 → (7, 7)
+        // Both should be in the same pool (same stream addresses).
+        apply_pass_result(&mut graph, &mut store, PassResult {
+            address_edges: vec![],
+            control_edges: vec![ControlEdgeObs {
+                source: src_b, target: tgt, is_length: true, is_eq: false,
+                sample: Some((7, 7)),
+            }],
+        });
+
+        let edge = graph.confirmed_edges().next().expect("edge must be confirmed");
+        assert_eq!(edge.kind, EdgeKind::Length);
+        // Two distinct (val, count) pairs from the shared pool → Identity fit.
+        assert!(edge.relation.is_some(), "pooled samples must produce a relation fit");
+    }
+
+    /// `apply_pass_result` upgrades a structural Control candidate to Length and
+    /// fits a relation across repeated samples.
     #[test]
     fn apply_results_confirms_and_fits() {
         let mut graph = StreamRelationGraph::new();
@@ -890,39 +984,28 @@ mod tests {
 
         let src = AccessContext::new(0x200, 0x5800_0008);
         let tgt = AccessContext::new(0x300, 0x5800_0000);
-
-        // Phase B is upgrade-only: it confirms a Phase-A structural candidate, it
-        // never invents edges.  Seed the structural candidate first.
         graph.add_structural_candidates(tgt, &[(src, EdgeKind::Control)]);
 
-        // Two passes with identity samples (count == value) → Identity relation fit.
         for v in [4u64, 7u64] {
-            let result = PassResult {
+            apply_pass_result(&mut graph, &mut store, PassResult {
                 address_edges: vec![],
                 control_edges: vec![ControlEdgeObs {
-                    source: src,
-                    target: tgt,
-                    is_length: true,
-                    is_eq: false,
+                    source: src, target: tgt, is_length: true, is_eq: false,
                     sample: Some((v, v)),
                 }],
-            };
-            apply_pass_result(&mut graph, &mut store, result);
+            });
         }
 
-        let edge = graph
-            .confirmed_edges()
-            .find(|e| e.source == src && e.target == tgt)
+        let edge = graph.confirmed_edges().find(|e| e.source == src && e.target == tgt)
             .expect("edge should be confirmed");
         assert_eq!(edge.kind, EdgeKind::Length);
         assert_eq!(edge.confidence, Confidence::TaintConfirmed);
-        assert!(edge.relation.is_some(), "a relation should be fitted from the samples");
+        assert!(edge.relation.is_some());
     }
 
-    /// A confirmed (non-looping) Control edge captures the gating source value as a
-    /// discriminant, so the mutator can later inject it to unlock the target.
+    /// Fix 3: Discriminant is captured only for equality-gated Control edges.
     #[test]
-    fn apply_results_captures_control_discriminant() {
+    fn apply_results_captures_control_discriminant_only_for_equality_gate() {
         let mut graph = StreamRelationGraph::new();
         let mut store = LengthSampleStore::new();
 
@@ -930,93 +1013,81 @@ mod tests {
         let tgt = AccessContext::new(0x300, 0x5800_0000);
         graph.add_structural_candidates(tgt, &[(src, EdgeKind::Control)]);
 
-        // Two passes observe distinct gating values (3, then 5) on a non-loop Control edge.
-        for v in [3u64, 5u64] {
-            let result = PassResult {
-                address_edges: vec![],
-                control_edges: vec![ControlEdgeObs {
-                    source: src,
-                    target: tgt,
-                    is_length: false,
-                    is_eq: true,
-                    sample: Some((v, 1)),
-                }],
-            };
-            apply_pass_result(&mut graph, &mut store, result);
-        }
+        // Pass 1: is_eq=true → value 3 must be recorded.
+        apply_pass_result(&mut graph, &mut store, PassResult {
+            address_edges: vec![],
+            control_edges: vec![ControlEdgeObs {
+                source: src, target: tgt, is_length: false, is_eq: true,
+                sample: Some((3, 1)),
+            }],
+        });
+        // Pass 2: is_eq=false (range check) → value 42 must NOT be recorded.
+        apply_pass_result(&mut graph, &mut store, PassResult {
+            address_edges: vec![],
+            control_edges: vec![ControlEdgeObs {
+                source: src, target: tgt, is_length: false, is_eq: false,
+                sample: Some((42, 1)),
+            }],
+        });
 
-        let edge = graph
-            .confirmed_edges()
-            .find(|e| e.source == src && e.target == tgt)
+        let edge = graph.confirmed_edges().find(|e| e.source == src && e.target == tgt)
             .expect("Control edge should be confirmed");
         assert_eq!(edge.kind, EdgeKind::Control);
-        let disc_vals: Vec<u64> = edge.value_set.iter().map(|&(v, _)| v).collect();
-        assert_eq!(disc_vals, vec![3, 5], "both gating values captured as discriminants");
+        let vals: Vec<u64> = edge.value_set.iter().map(|&(v, _)| v).collect();
+        assert_eq!(vals, vec![3], "only the equality-gated value must be captured");
+        assert!(!vals.contains(&42), "range-check value must not be captured as discriminant");
     }
 
-    /// An unbacked Control observation is dropped (no edge invented) AND records no
-    /// discriminant — the regression guard against spurious value injection.
+    /// An unbacked Control observation records no discriminant.
     #[test]
     fn apply_results_no_discriminant_without_structural_backing() {
         let mut graph = StreamRelationGraph::new();
         let mut store = LengthSampleStore::new();
         let src = AccessContext::new(0x200, 0x5800_0008);
         let tgt = AccessContext::new(0x300, 0x5800_0000);
-        // No structural candidate added → confirm_edge must fail and nothing recorded.
-        let result = PassResult {
+        apply_pass_result(&mut graph, &mut store, PassResult {
             address_edges: vec![],
             control_edges: vec![ControlEdgeObs {
-                source: src,
-                target: tgt,
-                is_length: false,
-                is_eq: true,
+                source: src, target: tgt, is_length: false, is_eq: true,
                 sample: Some((9, 1)),
             }],
-        };
-        apply_pass_result(&mut graph, &mut store, result);
+        });
         assert_eq!(graph.edge_count(), 0, "unbacked observation invents no edge");
     }
 
-    /// When the MMIO read value is suppressed at load time (production `LiveEnv`),
-    /// the concrete source value is recovered from the destination register at the
-    /// next block entry — enabling `Length` relation fitting across passes.
+    /// Deferred source-value capture from the next block entry (production LiveEnv path).
     #[test]
     fn deferred_source_value_capture_from_register() {
         let mut e = engine();
-        e.read_sites.insert(0x100, 0x5800_0008); // source A
+        e.read_sites.insert(0x100, 0x5800_0008);
 
-        // Block 1 @0x100: r5 = LOAD[r9]  (MMIO source; value suppressed → deferred).
         let mut p1 = pcode::Block::new();
         p1.push(marker(0x100));
         p1.push((reg(5), Op::Load(0), reg(9)));
         let b1 = lifter_block(p1, 0x100, 0x104, BlockExit::invalid());
 
-        // Block 2 @0x104: unrelated marker; its entry drains the pending capture.
         let mut p2 = pcode::Block::new();
         p2.push(marker(0x104));
         let b2 = lifter_block(p2, 0x104, 0x108, BlockExit::invalid());
 
         let mut env = MockEnv::new();
-        env.regs.insert(9, 0x5800_0008); // address register
-        // No backing memory at the MMIO address → read_mem returns None (suppressed).
+        env.regs.insert(9, 0x5800_0008);
 
         e.run_block(&b1, &mut env);
         let src = AccessContext::new(0x100, 0x5800_0008);
-        assert_eq!(e.source_value(src), None, "value not yet observable at load time");
+        assert_eq!(e.source_value(src), None);
 
-        // The real load has now executed: the destination register holds the value.
         env.regs.insert(5, 0x2a);
         e.run_block(&b2, &mut env);
-        assert_eq!(e.source_value(src), Some(0x2a), "value recovered at next block entry");
+        assert_eq!(e.source_value(src), Some(0x2a));
     }
 
-    /// A call (PcodeOp) clears r0–r3 taint so it cannot leak across an opaque call.
+    /// A call (PcodeOp) clears r0–r3 taint so it cannot leak across opaque calls.
     #[test]
     fn call_kills_argument_register_taint() {
         let mut e = engine();
         e.read_sites.insert(0x100, 0x5800_0000);
 
-        // r0 = LOAD[mmio] (tainted); CALL; then r0 must be clean.
         let mut p = pcode::Block::new();
         p.push(marker(0x100));
         p.push((reg(0), Op::Load(0), reg(5)));
@@ -1028,9 +1099,6 @@ mod tests {
         env.regs.insert(5, 0x5800_0000);
         e.run_block(&block, &mut env);
 
-        assert!(
-            e.shadow.reg_tag(0).is_clean(),
-            "r0 taint must be killed after an opaque call"
-        );
+        assert!(e.shadow.reg_tag(0).is_clean(), "r0 taint must be killed after an opaque call");
     }
 }
