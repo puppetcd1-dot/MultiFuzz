@@ -77,8 +77,24 @@ impl<'a> ConcreteEnv for LiveEnv<'a> {
 
     fn read_mem(&mut self, addr: u64, size: u8) -> Option<u64> {
         use icicle_vm::cpu::mem::perm;
-        if self.mmio_ranges.iter().any(|r| r.contains(&addr)) {
-            // Reading MMIO would trigger the IoMemory handler and consume a fuzz byte.
+        // CRITICAL: never let a Phase B taint read dispatch to an IoMemory handler.
+        //
+        // We are executing inside a CPU instruction hook, holding `&mut Cpu`.  The
+        // registered MMIO handler (`FuzzwareMmioHandler::read`) reconstructs a second
+        // `&mut Vm` from its raw `uc_ptr` — aliasing the `&mut Cpu` we already hold,
+        // which is undefined behaviour and corrupts the heap.  It would also consume a
+        // fuzz input byte as a side effect.
+        //
+        // The hardcoded `mmio_ranges` list is only the *default* Cortex-M peripheral
+        // window; firmware can map IO outside it.  `is_regular_region` is the
+        // authoritative check that `addr` is plain RAM/ROM (no IoMemory handler), so we
+        // gate on it in addition to the fast-path range check.  Any non-regular or
+        // out-of-range address yields `None` (the value is recovered later from the
+        // destination register via the deferred-capture path).
+        let len = size.max(1) as u64;
+        if self.mmio_ranges.iter().any(|r| r.contains(&addr))
+            || !self.cpu.mem.is_regular_region(addr, len)
+        {
             return None;
         }
         match size {
@@ -712,7 +728,14 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
 
     let hook_state = state.clone();
     let hook = vm.cpu.add_hook(move |cpu: &mut Cpu, addr: u64| {
-        let mut st = hook_state.borrow_mut();
+        // Use `try_borrow_mut`: if this hook ever fires re-entrantly (the engine is
+        // already running a block), a plain `borrow_mut` would panic — and that panic
+        // would unwind through the JIT/extern call boundary, aborting with "panic in a
+        // function that cannot unwind".  A re-entrant fire has nothing useful to do, so
+        // treat it as a no-op instead.
+        let Ok(mut st) = hook_state.try_borrow_mut() else {
+            return;
+        };
         if !st.armed {
             return;
         }
