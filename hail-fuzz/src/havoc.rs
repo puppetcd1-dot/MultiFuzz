@@ -669,7 +669,11 @@ fn collect_discriminants(
                 continue;
             }
             let list = map.entry(key).or_default();
-            for &v in &edge.value_set {
+            // Sort by hit_count descending so highest-frequency discriminants
+            // appear first; they are more likely to be the true gating values.
+            let mut sorted = edge.value_set.clone();
+            sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            for (v, _) in sorted {
                 if !list.contains(&v) {
                     list.push(v);
                 }

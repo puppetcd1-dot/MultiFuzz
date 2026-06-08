@@ -113,6 +113,12 @@ impl Relation {
             let db = b2 - b1;
             if da != 0 && db % da == 0 {
                 let k = db / da;
+                // k==0 means count_B is constant regardless of val_A — independence,
+                // not a controllable length relation.  Reject it so these edges stay
+                // Control rather than gaining a spurious Length classification.
+                if k == 0 {
+                    return None;
+                }
                 let c = b1 - k * a1;
                 // Verify against all samples.
                 let fits = pairs.iter().all(|(a, b)| {
@@ -137,11 +143,12 @@ pub struct StreamEdge {
     pub confidence: Confidence,
     /// Populated for confirmed Length edges: maps val_A → expected count_B.
     pub relation:   Option<Relation>,
-    /// Discriminating source values for a `Control` edge: concrete values of the
-    /// source stream observed (in Phase B) to open the path to the target.  The
-    /// mutator injects these directly so it does not have to rediscover the gating
-    /// value by random search — the key to unlocking command-dispatch peripherals.
-    pub value_set:  Vec<u64>,
+    /// Discriminating source values for a `Control` edge: `(value, hit_count)` pairs
+    /// observed in Phase B to open the path to the target.  Sorted by hit_count
+    /// descending so the most-confirmed discriminants are injected first.
+    /// Capped at `MAX_DISCRIMINANTS` entries; singletons are evicted to make room
+    /// for recurring values — high hit_count entries are immune to eviction.
+    pub value_set:  Vec<(u64, u32)>,
 }
 
 /// Directed graph of structural and taint-confirmed relationships between MMIO streams.
@@ -233,8 +240,16 @@ impl StreamRelationGraph {
             if edge.source == source && edge.target == target {
                 edge.kind = kind;
                 edge.confidence = Confidence::TaintConfirmed;
-                if relation.is_some() {
+                // Clear fields belonging to the previous kind so stale data
+                // (e.g. a relation from a prior Length phase, or discriminants
+                // from a prior Control phase) cannot persist on the new kind.
+                if kind != EdgeKind::Length {
+                    edge.relation = None;
+                } else if relation.is_some() {
                     edge.relation = relation;
+                }
+                if kind != EdgeKind::Control {
+                    edge.value_set.clear();
                 }
                 return true;
             }
@@ -250,8 +265,13 @@ impl StreamRelationGraph {
             if edge.source.addr == source.addr {
                 edge.kind = kind;
                 edge.confidence = Confidence::TaintConfirmed;
-                if relation.is_some() {
+                if kind != EdgeKind::Length {
+                    edge.relation = None;
+                } else if relation.is_some() {
                     edge.relation = relation.clone();
+                }
+                if kind != EdgeKind::Control {
+                    edge.value_set.clear();
                 }
                 upgraded = true;
             }
@@ -269,6 +289,15 @@ impl StreamRelationGraph {
     /// it without limit.  Only `Control` edges carry discriminants: `Length` edges
     /// already model the value→count mapping via `relation`, and `Address` edges
     /// consume the value as an address rather than a discriminator.
+    /// Record a discriminating source value on confirmed `Control` edge(s)
+    /// `source → target`.
+    ///
+    /// Uses frequency-based eviction: each (value, hit_count) pair is maintained
+    /// sorted by recurrence.  When the cap is reached a singleton (hit_count=1) is
+    /// evicted to make room for the new value; if all slots are multi-hit (genuine
+    /// recurring discriminants) the new value is discarded rather than displacing a
+    /// confirmed value.  This prevents one-time random fuzz bytes from permanently
+    /// blocking genuine command-code discriminants that appear repeatedly.
     pub fn record_discriminant(&mut self, source: StreamKey, target: StreamKey, value: u64) {
         const MAX_DISCRIMINANTS: usize = 16;
         let Some(indices) = self.incoming.get(&target).cloned() else {
@@ -276,12 +305,23 @@ impl StreamRelationGraph {
         };
         for idx in indices {
             let edge = &mut self.edges[idx];
-            if edge.source.addr == source
-                && edge.kind == EdgeKind::Control
-                && edge.value_set.len() < MAX_DISCRIMINANTS
-                && !edge.value_set.contains(&value)
-            {
-                edge.value_set.push(value);
+            if edge.source.addr != source || edge.kind != EdgeKind::Control {
+                continue;
+            }
+            // Increment hit count if already present.
+            if let Some(entry) = edge.value_set.iter_mut().find(|(v, _)| *v == value) {
+                entry.1 += 1;
+                continue;
+            }
+            // New value: insert directly if under cap.
+            if edge.value_set.len() < MAX_DISCRIMINANTS {
+                edge.value_set.push((value, 1));
+                continue;
+            }
+            // Cap full: evict the first singleton (hit_count==1) to make room.
+            // If all entries are multi-hit, the new (unconfirmed) value is discarded.
+            if let Some(pos) = edge.value_set.iter().position(|(_, c)| *c == 1) {
+                edge.value_set[pos] = (value, 1);
             }
         }
     }
@@ -360,12 +400,13 @@ impl StreamRelationGraph {
                 Some(r) => format!("{:?}", r.kind),
                 None => "none".to_string(),
             };
-            let values = e
-                .value_set
-                .iter()
-                .map(|v| format!("\"{v:#x}\""))
-                .collect::<Vec<_>>()
-                .join(",");
+            // Sort by hit_count descending: most-confirmed discriminants appear first
+            // in the JSON so offline analysis sees the highest-confidence values.
+            let values = {
+                let mut sorted = e.value_set.clone();
+                sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                sorted.iter().map(|(v, _)| format!("\"{v:#x}\"")).collect::<Vec<_>>().join(",")
+            };
             s.push_str(&format!(
                 "  {{\"source_pc\":\"{:#x}\",\"source_addr\":\"{:#x}\",\
                  \"target_pc\":\"{:#x}\",\"target_addr\":\"{:#x}\",\
@@ -391,46 +432,88 @@ mod tests {
     /// apply(invert(x)) must round-trip for all valid relation kinds.
     #[test]
     fn relation_invert_round_trips() {
-        // Identity: invert is the identity.
         let r = Relation { kind: RelKind::Identity };
         assert_eq!(r.invert(0), Some(0));
         assert_eq!(r.invert(5), Some(5));
         assert_eq!(r.apply(r.invert(99).unwrap()), 99);
 
-        // Half: invert doubles.
         let r = Relation { kind: RelKind::Half };
         assert_eq!(r.invert(4), Some(8));
         assert_eq!(r.apply(8), 4);
         assert_eq!(r.invert(0), Some(0));
 
-        // Linear{k=2, c=1}: count = 2*val + 1 → val = (count − 1) / 2.
         let r = Relation { kind: RelKind::Linear { k: 2, c: 1 } };
-        assert_eq!(r.invert(5), Some(2));   // (5−1)/2 = 2
-        assert_eq!(r.apply(2), 5);          // 2*2+1 = 5
-        assert_eq!(r.invert(1), Some(0));   // boundary: val = 0
+        assert_eq!(r.invert(5), Some(2));
+        assert_eq!(r.apply(2), 5);
+        assert_eq!(r.invert(1), Some(0));
 
-        // Linear with k=0 → degenerate, returns None.
         let r = Relation { kind: RelKind::Linear { k: 0, c: 5 } };
         assert_eq!(r.invert(5), None);
 
-        // Linear with k=1, c=0 → same as identity.
         let r = Relation { kind: RelKind::Linear { k: 1, c: 0 } };
         assert_eq!(r.invert(7), Some(7));
         assert_eq!(r.apply(r.invert(42).unwrap()), 42);
 
-        // Negative c: count = val + (-3) → val = count + 3.
         let r = Relation { kind: RelKind::Linear { k: 1, c: -3 } };
         assert_eq!(r.invert(0), Some(3));
         assert_eq!(r.apply(3), 0);
 
-        // Result would be negative → None.
         let r = Relation { kind: RelKind::Linear { k: 1, c: 10 } };
-        assert_eq!(r.invert(5), None); // (5 - 10) / 1 = -5 < 0
+        assert_eq!(r.invert(5), None);
+    }
+
+    /// Fix 1: Relation::fit must return None when all samples have the same count_B
+    /// (k==0 means independence, not a controllable length).
+    #[test]
+    fn fit_rejects_zero_slope_constant_count() {
+        // All count_B values equal 2 regardless of val_A → k=0, degenerate.
+        let pairs = vec![(1u64, 2u64), (3, 2), (7, 2), (10, 2)];
+        assert!(
+            Relation::fit(&pairs).is_none(),
+            "constant count_B must not produce a Linear{{k:0}} relation"
+        );
+        // Single pair: degenerate by definition (cannot distinguish constant from slope).
+        assert!(Relation::fit(&[(5, 3)]).is_none());
+    }
+
+    /// Fix 1: Non-zero slopes still fit correctly after the k==0 guard.
+    #[test]
+    fn fit_accepts_nonzero_slope() {
+        // count = -1 * val + 4  (the DMA pattern from the real relations.json)
+        let pairs = vec![(1u64, 3u64), (2, 2), (3, 1), (0, 4)];
+        let rel = Relation::fit(&pairs).expect("should fit Linear{k:-1,c:4}");
+        assert!(matches!(rel.kind, RelKind::Linear { k: -1, c: 4 }));
+    }
+
+    /// Fix 2: Reclassifying an edge clears stale fields from the previous kind.
+    #[test]
+    fn reclassification_clears_stale_relation_and_value_set() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+
+        // Start as Control; add a discriminant.
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+        g.confirm_edge(a, b, EdgeKind::Control, None);
+        g.record_discriminant(a.addr, b.addr, 0x3);
+        assert!(!g.governors(b.addr).next().unwrap().value_set.is_empty());
+
+        // Reclassify to Length: value_set must be cleared.
+        g.confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
+        let edge = g.governors(b.addr).next().unwrap();
+        assert_eq!(edge.kind, EdgeKind::Length);
+        assert!(edge.value_set.is_empty(), "reclassify→Length must clear value_set");
+        assert!(edge.relation.is_some(), "relation should be set after Length confirmation");
+
+        // Reclassify back to Control: relation must be cleared.
+        g.confirm_edge(a, b, EdgeKind::Control, None);
+        let edge = g.governors(b.addr).next().unwrap();
+        assert_eq!(edge.kind, EdgeKind::Control);
+        assert!(edge.relation.is_none(), "reclassify→Control must clear relation");
     }
 
     /// Phase B must NOT invent edges: an observation with no structural backing is
     /// dropped, so the confirmed graph can never exceed Phase A's candidate set.
-    /// This is the regression guard against the near-complete bipartite blow-up.
     #[test]
     fn confirm_without_structural_backing_is_dropped() {
         let mut g = StreamRelationGraph::new();
@@ -458,29 +541,94 @@ mod tests {
         assert_eq!(g.governors(0x5800_0004).next().unwrap().kind, EdgeKind::Length);
     }
 
-    /// Discriminating values accumulate on a confirmed Control edge, dedup, stay
-    /// bounded, and are never attached to a non-Control edge.
+    /// Fix 4: Discriminating values accumulate with hit counts, dedup increments
+    /// the existing count, and the set stays bounded at MAX_DISCRIMINANTS.
     #[test]
-    fn record_discriminant_accumulates_bounded_unique_values() {
+    fn record_discriminant_accumulates_with_hit_counts() {
         let mut g = StreamRelationGraph::new();
         let a = ctx(0x10, 0x5800_0000);
         let b = ctx(0x20, 0x5800_0004);
         g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
         g.confirm_edge(a, b, EdgeKind::Control, None);
 
-        // Distinct values accumulate; duplicates are ignored.
         g.record_discriminant(a.addr, b.addr, 3);
-        g.record_discriminant(a.addr, b.addr, 3);
+        g.record_discriminant(a.addr, b.addr, 3); // duplicate → hit_count=2
         g.record_discriminant(a.addr, b.addr, 7);
         let edge = g.governors(b.addr).next().unwrap();
-        assert_eq!(edge.value_set, vec![3, 7], "dedup distinct gating values");
+        let vals: Vec<u64> = edge.value_set.iter().map(|&(v, _)| v).collect();
+        assert_eq!(vals, vec![3, 7], "distinct values recorded");
+        assert_eq!(
+            edge.value_set.iter().find(|&&(v, _)| v == 3).map(|&(_, c)| c),
+            Some(2),
+            "duplicate increments hit_count"
+        );
+        assert_eq!(
+            edge.value_set.iter().find(|&&(v, _)| v == 7).map(|&(_, c)| c),
+            Some(1)
+        );
 
-        // The set is bounded (≤16): pushing many distinct values cannot grow it past the cap.
-        for v in 100..200 {
+        // Flood: cap must not be exceeded.
+        for v in 100u64..200 {
             g.record_discriminant(a.addr, b.addr, v);
         }
+        assert!(g.governors(b.addr).next().unwrap().value_set.len() <= 16);
+    }
+
+    /// Fix 4: Frequency-based eviction — a singleton is evicted when the cap is
+    /// full, but a multi-hit entry survives.
+    #[test]
+    fn record_discriminant_frequency_eviction_protects_recurring_values() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+        g.confirm_edge(a, b, EdgeKind::Control, None);
+
+        // Fill cap with 16 distinct singletons.
+        for v in 0u64..16 {
+            g.record_discriminant(a.addr, b.addr, v);
+        }
+        // Reinforce value 0 → hit_count=2.
+        g.record_discriminant(a.addr, b.addr, 0);
+        // Push a 17th value: must evict a singleton (hit_count=1), not value 0.
+        g.record_discriminant(a.addr, b.addr, 99);
+
         let edge = g.governors(b.addr).next().unwrap();
-        assert!(edge.value_set.len() <= 16, "discriminant set must stay bounded");
+        assert_eq!(edge.value_set.len(), 16, "cap must stay at 16 after eviction");
+        assert!(
+            edge.value_set.iter().any(|&(v, _)| v == 0),
+            "multi-hit value must not be evicted"
+        );
+        assert!(
+            edge.value_set.iter().any(|&(v, _)| v == 99),
+            "new value must be inserted after evicting a singleton"
+        );
+        // Value 1 was the first singleton after 0, so it should be evicted.
+        assert!(
+            !edge.value_set.iter().any(|&(v, _)| v == 1),
+            "evicted singleton must be gone"
+        );
+    }
+
+    /// Fix 4: When all entries are multi-hit, a new singleton is discarded
+    /// rather than displacing a confirmed recurring value.
+    #[test]
+    fn record_discriminant_discards_when_all_entries_are_recurring() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+        g.confirm_edge(a, b, EdgeKind::Control, None);
+
+        // Fill cap, then make all entries multi-hit.
+        for v in 0u64..16 {
+            g.record_discriminant(a.addr, b.addr, v);
+            g.record_discriminant(a.addr, b.addr, v); // hit_count=2 for each
+        }
+        // Now push a new value: all existing are multi-hit, so discard.
+        g.record_discriminant(a.addr, b.addr, 999);
+        let edge = g.governors(b.addr).next().unwrap();
+        assert!(!edge.value_set.iter().any(|&(v, _)| v == 999), "singleton discarded when all entries recurring");
     }
 
     /// A discriminant is only attached to `Control` edges — never `Length`/`Address`.
@@ -506,7 +654,6 @@ mod tests {
         let b_struct = ctx(0x20, 0x5800_0004);
         g.add_structural_candidates(b_struct, &[(a_struct, EdgeKind::Control)]);
 
-        // Phase B observed the same streams at different PCs.
         let a_obs = ctx(0x99, 0x5800_0000);
         let b_obs = ctx(0xaa, 0x5800_0004);
         let upgraded = g.confirm_edge(a_obs, b_obs, EdgeKind::Control, None);

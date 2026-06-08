@@ -100,8 +100,13 @@ impl<'a> ConcreteEnv for LiveEnv<'a> {
 pub struct ControlEdgeObs {
     pub source: AccessContext,
     pub target: AccessContext,
-    /// The gating branch was a runtime loop and B was read ≥2 times → `Length`.
+    /// The gating branch was a runtime loop and B was read ≥3 times → `Length`.
     pub is_length: bool,
+    /// The condition that gated the branch to B was derived from an equality
+    /// comparison (`IntEqual`/`IntNotEqual`), not a range/arithmetic check.
+    /// Only equality-gated sources produce meaningful discriminants: a value that
+    /// passes `cmd == 3` IS a discriminant; a value that passes `size < 256` is not.
+    pub is_eq: bool,
     /// `(source_value, target_read_count)` for relation fitting, when the source
     /// value could be observed without MMIO side effects.
     pub sample: Option<(u64, u64)>,
@@ -122,9 +127,14 @@ pub struct PassResult {
 
 /// Accumulates `(value_A, count_B)` samples per `Length` edge across multiple
 /// taint passes so a `Relation` can be fitted once enough distinct points exist.
+///
+/// Keyed by `(source_addr, target_addr)` rather than by full `AccessContext` so
+/// that multiple read PCs for the same source→target stream pair pool their samples
+/// into a single list.  Five distinct read sites accessing the same DMA register all
+/// contribute to the same fit, giving the estimator much more statistical power.
 #[derive(Default)]
 pub struct LengthSampleStore {
-    samples: HashMap<(AccessContext, AccessContext), Vec<(u64, u64)>>,
+    samples: HashMap<(StreamKey, StreamKey), Vec<(u64, u64)>>,
 }
 
 impl LengthSampleStore {
@@ -138,7 +148,10 @@ impl LengthSampleStore {
         edge: (AccessContext, AccessContext),
         sample: (u64, u64),
     ) -> Option<Relation> {
-        let v = self.samples.entry(edge).or_default();
+        // Project to address granularity: multiple read-site PCs for the same
+        // stream-level edge share one sample list for better fitting power.
+        let key = (edge.0.addr, edge.1.addr);
+        let v = self.samples.entry(key).or_default();
         if !v.contains(&sample) {
             v.push(sample);
         }
@@ -156,6 +169,11 @@ struct CtrlObs {
     fires: u64,
     /// The gating branch was observed as a runtime loop (its PC was revisited).
     is_loop: bool,
+    /// At least one activating branch for this source→target pair was derived from
+    /// an equality comparison (`IntEqual`/`IntNotEqual`).  Only equality-gated
+    /// observations produce useful discriminants; inequality checks (range guards)
+    /// produce noise.
+    is_eq: bool,
 }
 
 /// Dynamic taint interpreter operating one block at a time.
@@ -168,7 +186,17 @@ pub struct PhaseBEngine {
     // ── per-block scratch (negative ids = temporaries, cleared per block) ──
     def_concrete: HashMap<VarId, Option<u64>>,
     def_taint: HashMap<VarId, TaintTag>,
+    /// Varnodes whose value was produced by an `IntEqual` / `IntNotEqual` op
+    /// (or `BoolNot` of one) in the current block.  Used to gate discriminant
+    /// capture on equality-type conditions at block exit.
+    def_eq_derived: HashSet<VarId>,
     cur_pc: u64,
+
+    // ── per-pass state ──
+    /// Branch PCs at which the tainted condition was derived from an equality
+    /// comparison this pass.  Persists across blocks so MMIO reads attributed
+    /// to that branch later in the pass correctly inherit is_eq.
+    branch_is_eq: HashSet<u64>,
 
     // ── per-pass observations ──
     /// How many times each MMIO context was read this pass.
@@ -200,7 +228,9 @@ impl PhaseBEngine {
             mmio_ranges,
             def_concrete: HashMap::new(),
             def_taint: HashMap::new(),
+            def_eq_derived: HashSet::new(),
             cur_pc: 0,
+            branch_is_eq: HashSet::new(),
             target_reads: HashMap::new(),
             source_last_val: HashMap::new(),
             pending_src_vals: Vec::new(),
@@ -224,6 +254,7 @@ impl PhaseBEngine {
         self.source_last_val.clear();
         self.pending_src_vals.clear();
         self.branch_visits.clear();
+        self.branch_is_eq.clear();
         self.gating.clear();
         self.gating_set.clear();
         self.addr_edges.clear();
@@ -300,6 +331,7 @@ impl PhaseBEngine {
         // from `env` (the live block-entry state) on first use within the block.
         self.def_concrete.clear();
         self.def_taint.clear();
+        self.def_eq_derived.clear();
         self.cur_pc = block.start;
 
         // Capture the concrete value of any source MMIO read from the previous block:
@@ -346,6 +378,9 @@ impl PhaseBEngine {
                             obs.fires += 1;
                             if self.branch_visits.get(&bpc).copied().unwrap_or(0) >= 2 {
                                 obs.is_loop = true;
+                            }
+                            if self.branch_is_eq.contains(&bpc) {
+                                obs.is_eq = true;
                             }
                         }
 
@@ -418,10 +453,20 @@ impl PhaseBEngine {
                     self.set_def(stmt.output, c, ta.union(&tb));
                 }
 
-                // Other binary/comparison ops: taint propagates, concrete is dropped
-                // (their result is not used to compute memory addresses we model).
+                // Equality comparisons: taint propagates AND the output is marked as
+                // equality-derived for discriminant-capture gating at block exit.
+                Op::IntEqual | Op::IntNotEqual => {
+                    let ta = self.taint_in(stmt.inputs.first());
+                    let tb = self.taint_in(stmt.inputs.second());
+                    self.set_def(stmt.output, None, ta.union(&tb));
+                    if !stmt.output.is_invalid() {
+                        self.def_eq_derived.insert(stmt.output.id);
+                    }
+                }
+
+                // Other binary/comparison ops: taint propagates, concrete is dropped.
                 Op::IntDiv | Op::IntSignedDiv | Op::IntRem | Op::IntSignedRem
-                | Op::IntRotateLeft | Op::IntRotateRight | Op::IntEqual | Op::IntNotEqual
+                | Op::IntRotateLeft | Op::IntRotateRight
                 | Op::IntLess | Op::IntSignedLess | Op::IntLessEqual | Op::IntSignedLessEqual
                 | Op::IntCarry | Op::IntSignedCarry | Op::IntSignedBorrow | Op::BoolAnd
                 | Op::BoolOr | Op::BoolXor => {
@@ -430,10 +475,25 @@ impl PhaseBEngine {
                     self.set_def(stmt.output, None, ta.union(&tb));
                 }
 
-                Op::IntNot | Op::IntNegate | Op::IntCountOnes | Op::IntCountLeadingZeroes
-                | Op::BoolNot => {
+                Op::IntNot | Op::IntNegate | Op::IntCountOnes | Op::IntCountLeadingZeroes => {
                     let t = self.taint_in(stmt.inputs.first());
                     self.set_def(stmt.output, None, t);
+                }
+
+                // BoolNot of an equality-derived condition is still equality-derived
+                // (it is just the negation of the same equality test).
+                Op::BoolNot => {
+                    let t = self.taint_in(stmt.inputs.first());
+                    self.set_def(stmt.output, None, t);
+                    if !stmt.output.is_invalid() {
+                        let input_is_eq = match stmt.inputs.first() {
+                            Value::Var(vn) => self.def_eq_derived.contains(&vn.id),
+                            _ => false,
+                        };
+                        if input_is_eq {
+                            self.def_eq_derived.insert(stmt.output.id);
+                        }
+                    }
                 }
 
                 // Calls: conservative kill of r0–r3 (accept under-tainting; see plan Fix 4).
@@ -457,6 +517,11 @@ impl PhaseBEngine {
                 if !cond_tag.is_clean() {
                     let bpc = self.cur_pc;
                     *self.branch_visits.entry(bpc).or_insert(0) += 1;
+                    // Track whether this branch condition was derived from an equality
+                    // comparison so MMIO reads that reach here can be flagged is_eq.
+                    if self.def_eq_derived.contains(&cond.id) {
+                        self.branch_is_eq.insert(bpc);
+                    }
                     for src in self.contexts_of(&cond_tag) {
                         let key = (src, bpc);
                         if self.gating_set.insert(key) {
@@ -475,9 +540,18 @@ impl PhaseBEngine {
         let mut control_edges = Vec::new();
         for (&(src, tgt), obs) in &self.ctrl_obs {
             let count = self.target_reads.get(&tgt).copied().unwrap_or(0);
-            let is_length = obs.is_loop && count >= 2 && obs.fires >= 2;
+            // Require ≥3 reads (not ≥2) to classify as Length: a count of exactly 2
+            // sits on the threshold and flip-flops between passes, leaking stale
+            // relations onto Control edges.  Three reads confirm a genuine loop.
+            let is_length = obs.is_loop && count >= 3 && obs.fires >= 2;
             let sample = self.source_last_val.get(&src).map(|&v| (v, count));
-            control_edges.push(ControlEdgeObs { source: src, target: tgt, is_length, sample });
+            control_edges.push(ControlEdgeObs {
+                source: src,
+                target: tgt,
+                is_length,
+                is_eq: obs.is_eq,
+                sample,
+            });
         }
 
         PassResult { address_edges, control_edges }
@@ -501,12 +575,16 @@ pub fn apply_pass_result(
             };
             graph.confirm_edge(obs.source, obs.target, EdgeKind::Length, relation);
         } else if graph.confirm_edge(obs.source, obs.target, EdgeKind::Control, None) {
-            // Capture the gating source value so the mutator can inject it directly
-            // to open the path to the target.  Only recorded when the Control edge
-            // was structurally backed (confirm_edge returned true); an unbacked
-            // observation is a taint over-approximation and is dropped along with it.
-            if let Some((val, _count)) = obs.sample {
-                graph.record_discriminant(obs.source.addr, obs.target.addr, val);
+            // Capture the gating source value as a discriminant ONLY when:
+            //   (a) the Control edge is structurally backed (confirm_edge returned
+            //       true) — unbacked observations are taint over-approximation noise;
+            //   (b) the condition was derived from an equality comparison (is_eq) —
+            //       a value that passes `cmd == 3` is a real discriminant; a value
+            //       that passes `size < 256` is an arbitrary data point, not useful.
+            if obs.is_eq {
+                if let Some((val, _count)) = obs.sample {
+                    graph.record_discriminant(obs.source.addr, obs.target.addr, val);
+                }
             }
         }
     }
@@ -825,6 +903,7 @@ mod tests {
                     source: src,
                     target: tgt,
                     is_length: true,
+                    is_eq: false,
                     sample: Some((v, v)),
                 }],
             };
@@ -859,6 +938,7 @@ mod tests {
                     source: src,
                     target: tgt,
                     is_length: false,
+                    is_eq: true,
                     sample: Some((v, 1)),
                 }],
             };
@@ -870,7 +950,8 @@ mod tests {
             .find(|e| e.source == src && e.target == tgt)
             .expect("Control edge should be confirmed");
         assert_eq!(edge.kind, EdgeKind::Control);
-        assert_eq!(edge.value_set, vec![3, 5], "both gating values captured as discriminants");
+        let disc_vals: Vec<u64> = edge.value_set.iter().map(|&(v, _)| v).collect();
+        assert_eq!(disc_vals, vec![3, 5], "both gating values captured as discriminants");
     }
 
     /// An unbacked Control observation is dropped (no edge invented) AND records no
@@ -888,6 +969,7 @@ mod tests {
                 source: src,
                 target: tgt,
                 is_length: false,
+                is_eq: true,
                 sample: Some((9, 1)),
             }],
         };
