@@ -695,21 +695,33 @@ impl icicle_vm::CodeInjector for PhaseBInjector {
             // InstructionMarker — the emulated PC has not been established and the
             // JIT falls back to `jmp r13`, crashing at address 0x2540be400.  The
             // same corrupted JIT output also produces spurious host-memory writes
-            // that corrupt glibc malloc metadata (detected later as "corrupted size
-            // vs. prev_size" during build_reverse_cfg).  Placing the hook after the
-            // first InstructionMarker gives the JIT a defined emulated PC and avoids
-            // both failure modes.
-            let insert_pos = block
+            // that corrupt glibc malloc metadata.
+            //
+            // If the block has NO InstructionMarker at all (e.g., synthetic helper
+            // blocks or empty lifter artefacts), skip injection entirely rather than
+            // falling back to position 0.  Inserting at position 0 is the root cause
+            // of the JIT crash; skipping is safe because such blocks carry no MMIO
+            // loads that the taint engine needs to observe.
+            let insert_pos = match block
                 .pcode
                 .instructions
                 .iter()
                 .position(|s| s.op == pcode::Op::InstructionMarker)
-                .map_or(0, |p| p + 1);
+            {
+                Some(p) => p + 1,
+                None => continue, // No InstructionMarker — skip rather than crash
+            };
 
             // Cache the *clean* block (no hook) before modifying the live copy.
+            // `code.modified.insert(id)` is intentionally omitted: this injector runs
+            // only on freshly-lifted (never-yet-JIT-compiled) blocks, so Icicle's own
+            // `code.modified.extend(group.range())` (which runs after all injectors)
+            // already covers them.  Adding a redundant entry would increment
+            // `jit.dead` for blocks that have no JIT code to invalidate, inflating
+            // the dead-block counter and potentially triggering a premature JIT purge
+            // that frees code still reachable via interpreter dispatch tables.
             self.state.borrow_mut().blocks.insert(block.start, block.clone());
             block.pcode.instructions.insert(insert_pos, pcode::Op::Hook(self.hook).into());
-            code.modified.insert(id);
         }
     }
 }
