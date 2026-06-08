@@ -663,9 +663,36 @@ impl icicle_vm::CodeInjector for PhaseBInjector {
     fn inject(&mut self, _cpu: &mut Cpu, group: &BlockGroup, code: &mut BlockTable) {
         for id in group.range() {
             let block = &mut code.blocks[id];
-            // Cache the *clean* block before inserting the hook op into the live copy.
+
+            // Guard: skip blocks already in the cache.  The injector is called for
+            // every newly-lifted block group, but a snapshot-restore cycle can cause
+            // blocks to be re-lifted; without this guard a second Op::Hook would be
+            // inserted, producing invalid P-code that the JIT cannot handle.
+            if self.state.borrow().blocks.contains_key(&block.start) {
+                continue;
+            }
+
+            // Insert the hook AFTER the first InstructionMarker rather than at
+            // position 0.  Icicle's JIT code generator uses `r13` (the icount
+            // register, initialised to `icount_limit` = 10^10 = 0x2540be400) for
+            // exit-branch computation.  When Op::Hook is at position 0 — before any
+            // InstructionMarker — the emulated PC has not been established and the
+            // JIT falls back to `jmp r13`, crashing at address 0x2540be400.  The
+            // same corrupted JIT output also produces spurious host-memory writes
+            // that corrupt glibc malloc metadata (detected later as "corrupted size
+            // vs. prev_size" during build_reverse_cfg).  Placing the hook after the
+            // first InstructionMarker gives the JIT a defined emulated PC and avoids
+            // both failure modes.
+            let insert_pos = block
+                .pcode
+                .instructions
+                .iter()
+                .position(|s| s.op == pcode::Op::InstructionMarker)
+                .map_or(0, |p| p + 1);
+
+            // Cache the *clean* block (no hook) before modifying the live copy.
             self.state.borrow_mut().blocks.insert(block.start, block.clone());
-            block.pcode.instructions.insert(0, pcode::Op::Hook(self.hook).into());
+            block.pcode.instructions.insert(insert_pos, pcode::Op::Hook(self.hook).into());
             code.modified.insert(id);
         }
     }
