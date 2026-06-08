@@ -2,6 +2,12 @@ use hashbrown::HashMap;
 
 use crate::input::StreamKey;
 
+/// Phase B passes an unconfirmed `Structural` edge may survive before it stops
+/// biasing mutation.  Phase A over-approximates control dependence, so a candidate
+/// that this many taint passes never confirmed is treated as a false positive and
+/// soft-expired (its mutation weight drops to neutral).  Confirmed edges never age.
+const STRUCTURAL_EXPIRY: u32 = 8;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // AccessContext
 // ──────────────────────────────────────────────────────────────────────────────
@@ -35,6 +41,27 @@ pub enum EdgeKind {
     Control,
     /// Value of source stream governed the loop trip count / copy size for target.
     Length,
+}
+
+impl EdgeKind {
+    /// Specificity ranking used to resolve classification conflicts.
+    ///
+    /// A single source value frequently plays several roles for one target: a
+    /// value that indexes B's address (`base + A`) is usually *also* checked in a
+    /// branch (`if (A) …`).  When that happens the observation produces both an
+    /// `Address` and a `Control` confirmation for the same edge.  The more specific
+    /// classification — precise value-into-address flow — must win, so a confirmed
+    /// edge is never downgraded to a coarser kind.  `Address` (exact value flow) >
+    /// `Length` (loop trip count) > `Control` (mere gating).  This mirrors the
+    /// "Address provenance takes priority over Control" rule Phase A already applies
+    /// in `into_candidates`.
+    pub fn priority(self) -> u8 {
+        match self {
+            EdgeKind::Address => 3,
+            EdgeKind::Length => 2,
+            EdgeKind::Control => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +176,14 @@ pub struct StreamEdge {
     /// Capped at `MAX_DISCRIMINANTS` entries; singletons are evicted to make room
     /// for recurring values — high hit_count entries are immune to eviction.
     pub value_set:  Vec<(u64, u32)>,
+    /// Number of Phase B passes this edge has survived as an unconfirmed
+    /// `Structural` candidate.  Phase A over-approximates control dependence (it
+    /// reaches *every* MMIO read that could feed any gating branch on a path to B),
+    /// so a candidate that many taint passes never confirm is most likely a false
+    /// positive.  `age_structural_edges` increments this once per pass; past
+    /// `STRUCTURAL_EXPIRY` the edge stops biasing mutation (soft expiration).  A
+    /// `TaintConfirmed` edge keeps `decay == 0` and never expires.
+    pub decay:      u32,
 }
 
 /// Directed graph of structural and taint-confirmed relationships between MMIO streams.
@@ -199,6 +234,7 @@ impl StreamRelationGraph {
                 confidence: Confidence::Structural,
                 relation: None,
                 value_set: Vec::new(),
+                decay: 0,
             });
             self.outgoing.entry(source.addr).or_default().push(idx);
             self.incoming.entry(target.addr).or_default().push(idx);
@@ -238,19 +274,7 @@ impl StreamRelationGraph {
         for &idx in &indices {
             let edge = &mut self.edges[idx];
             if edge.source == source && edge.target == target {
-                edge.kind = kind;
-                edge.confidence = Confidence::TaintConfirmed;
-                // Clear fields belonging to the previous kind so stale data
-                // (e.g. a relation from a prior Length phase, or discriminants
-                // from a prior Control phase) cannot persist on the new kind.
-                if kind != EdgeKind::Length {
-                    edge.relation = None;
-                } else if relation.is_some() {
-                    edge.relation = relation;
-                }
-                if kind != EdgeKind::Control {
-                    edge.value_set.clear();
-                }
+                Self::apply_confirmation(edge, kind, relation);
                 return true;
             }
         }
@@ -263,20 +287,47 @@ impl StreamRelationGraph {
         for &idx in &indices {
             let edge = &mut self.edges[idx];
             if edge.source.addr == source.addr {
-                edge.kind = kind;
-                edge.confidence = Confidence::TaintConfirmed;
-                if kind != EdgeKind::Length {
-                    edge.relation = None;
-                } else if relation.is_some() {
-                    edge.relation = relation.clone();
-                }
-                if kind != EdgeKind::Control {
-                    edge.value_set.clear();
-                }
+                Self::apply_confirmation(edge, kind, relation.clone());
                 upgraded = true;
             }
         }
         upgraded
+    }
+
+    /// Apply a Phase B confirmation to a single edge, honouring kind priority.
+    ///
+    /// Confidence is always raised to `TaintConfirmed` and `decay` is reset to 0
+    /// (the edge is now backed by observed taint and must never expire).  The
+    /// *kind* is only adopted when it is at least as specific as the edge's current
+    /// kind — a confirmed `Address` edge is never downgraded to `Control`, and a
+    /// confirmed `Length` (loop) edge is never downgraded to `Control`.  This makes
+    /// the order in which `apply_pass_result` confirms address vs control edges
+    /// irrelevant, and stops a value's gating role from erasing its address role.
+    /// Stale fields belonging to a superseded kind are cleared on adoption.
+    fn apply_confirmation(edge: &mut StreamEdge, kind: EdgeKind, relation: Option<Relation>) {
+        // Phase B observed real taint between these streams: raise confidence and
+        // reset the aging counter regardless of which channel was observed.
+        edge.confidence = Confidence::TaintConfirmed;
+        edge.decay = 0;
+
+        // Adopt the new kind only when it is at least as specific as the current
+        // one (Address > Length > Control).  A less-specific observation (e.g. the
+        // gating role of a value that also computes an address) raises confidence
+        // but does not erase the more-specific classification.
+        if kind.priority() >= edge.kind.priority() {
+            edge.kind = kind;
+            // Clear fields belonging to the previous kind so stale data (a relation
+            // from a prior Length phase, or discriminants from a prior Control phase)
+            // cannot persist on the new kind.
+            if kind != EdgeKind::Length {
+                edge.relation = None;
+            } else if relation.is_some() {
+                edge.relation = relation;
+            }
+            if kind != EdgeKind::Control {
+                edge.value_set.clear();
+            }
+        }
     }
 
     /// Record a discriminating source value on confirmed `Control` edge(s)
@@ -326,6 +377,30 @@ impl StreamRelationGraph {
         }
     }
 
+    /// Advance the aging clock by one Phase B pass.
+    ///
+    /// Every edge still at `Confidence::Structural` has its `decay` incremented;
+    /// confirmed edges are untouched (they keep `decay == 0`).  Once a structural
+    /// edge's `decay` reaches `STRUCTURAL_EXPIRY` it is considered a Phase A false
+    /// positive and `mutation_weight_factor` stops boosting it, so accumulated
+    /// unconfirmed candidates can no longer skew coverage exploration indefinitely.
+    /// Called once per `run_phase_b_pass`.
+    pub fn age_structural_edges(&mut self) {
+        for edge in &mut self.edges {
+            if edge.confidence == Confidence::Structural && edge.decay < u32::MAX {
+                edge.decay += 1;
+            }
+        }
+    }
+
+    /// Number of structural edges that have soft-expired (for diagnostics/telemetry).
+    pub fn expired_structural_count(&self) -> usize {
+        self.edges
+            .iter()
+            .filter(|e| e.confidence == Confidence::Structural && e.decay >= STRUCTURAL_EXPIRY)
+            .count()
+    }
+
     /// True if an edge with this exact context pair already exists.
     pub fn has_edge(&self, source: AccessContext, target: AccessContext) -> bool {
         self.incoming
@@ -368,6 +443,12 @@ impl StreamRelationGraph {
         for list in [self.incoming.get(&addr), self.outgoing.get(&addr)].into_iter().flatten() {
             for &idx in list {
                 let edge = &self.edges[idx];
+                // Soft-expired structural candidates (never confirmed across many
+                // taint passes) contribute no bias — they are treated as Phase A
+                // false positives so they cannot skew exploration forever.
+                if edge.confidence == Confidence::Structural && edge.decay >= STRUCTURAL_EXPIRY {
+                    continue;
+                }
                 let base = match edge.kind {
                     EdgeKind::Address | EdgeKind::Length => 4.0,
                     EdgeKind::Control => 2.0,
@@ -411,9 +492,9 @@ impl StreamRelationGraph {
                 "  {{\"source_pc\":\"{:#x}\",\"source_addr\":\"{:#x}\",\
                  \"target_pc\":\"{:#x}\",\"target_addr\":\"{:#x}\",\
                  \"kind\":\"{:?}\",\"confidence\":\"{:?}\",\"relation\":\"{}\",\
-                 \"values\":[{}]}}",
+                 \"decay\":{},\"values\":[{}]}}",
                 e.source.pc, e.source.addr, e.target.pc, e.target.addr,
-                e.kind, e.confidence, relation, values
+                e.kind, e.confidence, relation, e.decay, values
             ));
         }
         s.push_str("\n]\n");
@@ -485,7 +566,8 @@ mod tests {
         assert!(matches!(rel.kind, RelKind::Linear { k: -1, c: 4 }));
     }
 
-    /// Fix 2: Reclassifying an edge clears stale fields from the previous kind.
+    /// Fix 2: Reclassifying an edge to a *more specific* kind clears stale fields
+    /// from the previous kind (Control→Length drops the discriminant value_set).
     #[test]
     fn reclassification_clears_stale_relation_and_value_set() {
         let mut g = StreamRelationGraph::new();
@@ -498,18 +580,104 @@ mod tests {
         g.record_discriminant(a.addr, b.addr, 0x3);
         assert!(!g.governors(b.addr).next().unwrap().value_set.is_empty());
 
-        // Reclassify to Length: value_set must be cleared.
+        // Reclassify to Length (priority Length > Control): value_set must be cleared.
         g.confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
         let edge = g.governors(b.addr).next().unwrap();
         assert_eq!(edge.kind, EdgeKind::Length);
         assert!(edge.value_set.is_empty(), "reclassify→Length must clear value_set");
         assert!(edge.relation.is_some(), "relation should be set after Length confirmation");
+    }
 
-        // Reclassify back to Control: relation must be cleared.
+    /// Issue #2 fix: a confirmed `Address` edge is never downgraded to `Control`.
+    ///
+    /// A source value that computes B's address (`base + A`) is usually *also*
+    /// checked in a branch, so the same edge receives both an Address and a Control
+    /// confirmation.  Address (precise value flow) must win regardless of order.
+    #[test]
+    fn address_confirmation_is_not_downgraded_by_control() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        // Phase A may seed it as a Control candidate.
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+
+        // Phase B confirms the Address channel first (as apply_pass_result does).
+        g.confirm_edge(a, b, EdgeKind::Address, None);
+        assert_eq!(g.governors(b.addr).next().unwrap().kind, EdgeKind::Address);
+
+        // A later Control confirmation for the same edge must NOT clobber Address.
         g.confirm_edge(a, b, EdgeKind::Control, None);
         let edge = g.governors(b.addr).next().unwrap();
-        assert_eq!(edge.kind, EdgeKind::Control);
-        assert!(edge.relation.is_none(), "reclassify→Control must clear relation");
+        assert_eq!(edge.kind, EdgeKind::Address, "Control must not downgrade Address");
+        assert_eq!(edge.confidence, Confidence::TaintConfirmed);
+    }
+
+    /// A confirmed `Length` (loop) edge is likewise not downgraded by a later
+    /// non-looping Control observation — the fitted relation is preserved.
+    #[test]
+    fn length_confirmation_is_not_downgraded_by_control() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+
+        g.confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
+        g.confirm_edge(a, b, EdgeKind::Control, None);
+        let edge = g.governors(b.addr).next().unwrap();
+        assert_eq!(edge.kind, EdgeKind::Length, "Control must not downgrade Length");
+        assert!(edge.relation.is_some(), "fitted relation must be preserved");
+    }
+
+    /// Issue #1 fix: an unconfirmed structural edge soft-expires after
+    /// `STRUCTURAL_EXPIRY` passes — its mutation weight drops back to neutral so a
+    /// Phase A false positive cannot bias exploration forever.
+    #[test]
+    fn structural_edge_soft_expires_after_aging() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b, &[(a, EdgeKind::Address)]);
+
+        // Fresh structural Address edge biases mutation (>1.0).
+        assert!(g.mutation_weight_factor(a.addr) > 1.0);
+        assert_eq!(g.expired_structural_count(), 0);
+
+        // Age it past the expiry threshold without ever confirming it.
+        for _ in 0..STRUCTURAL_EXPIRY {
+            g.age_structural_edges();
+        }
+        assert_eq!(g.expired_structural_count(), 1, "edge must be counted as expired");
+        assert_eq!(
+            g.mutation_weight_factor(a.addr),
+            1.0,
+            "expired structural edge must contribute no mutation bias"
+        );
+    }
+
+    /// Confirming an edge resets its aging clock, so a genuine (taint-confirmed)
+    /// edge never expires even after many subsequent passes.
+    #[test]
+    fn confirmation_resets_decay_and_protects_from_expiry() {
+        let mut g = StreamRelationGraph::new();
+        let a = ctx(0x10, 0x5800_0000);
+        let b = ctx(0x20, 0x5800_0004);
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+
+        // Age it most of the way to expiry, then confirm.
+        for _ in 0..(STRUCTURAL_EXPIRY - 1) {
+            g.age_structural_edges();
+        }
+        g.confirm_edge(a, b, EdgeKind::Control, None);
+
+        // Many more passes must not expire a confirmed edge.
+        for _ in 0..(STRUCTURAL_EXPIRY * 4) {
+            g.age_structural_edges();
+        }
+        assert_eq!(g.expired_structural_count(), 0, "confirmed edge must never expire");
+        assert!(
+            g.mutation_weight_factor(a.addr) > 1.0,
+            "confirmed edge keeps biasing mutation"
+        );
     }
 
     /// Phase B must NOT invent edges: an observation with no structural backing is

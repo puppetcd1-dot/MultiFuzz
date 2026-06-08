@@ -1003,6 +1003,35 @@ mod tests {
         assert!(edge.relation.is_some());
     }
 
+    /// Issue #2: when a source both computes B's address AND gates a branch to B,
+    /// `apply_pass_result` confirms address_edges before control_edges.  The edge
+    /// must end up classified `Address`, not clobbered to `Control` by the later
+    /// control confirmation.
+    #[test]
+    fn apply_results_keeps_address_when_source_also_gates() {
+        let mut graph = StreamRelationGraph::new();
+        let mut store = LengthSampleStore::new();
+
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        graph.add_structural_candidates(tgt, &[(src, EdgeKind::Control)]);
+
+        // One pass reports the SAME source on both channels (address + gating).
+        apply_pass_result(&mut graph, &mut store, PassResult {
+            address_edges: vec![(src, tgt)],
+            control_edges: vec![ControlEdgeObs {
+                source: src, target: tgt, is_length: false, is_eq: true,
+                sample: Some((4, 1)),
+            }],
+        });
+
+        let edge = graph.confirmed_edges().find(|e| e.source == src && e.target == tgt)
+            .expect("edge should be confirmed");
+        assert_eq!(edge.kind, EdgeKind::Address, "address role must win over gating role");
+        // An Address edge carries no discriminant value_set.
+        assert!(edge.value_set.is_empty(), "Address edge must not accumulate discriminants");
+    }
+
     /// Fix 3: Discriminant is captured only for equality-gated Control edges.
     #[test]
     fn apply_results_captures_control_discriminant_only_for_equality_gate() {

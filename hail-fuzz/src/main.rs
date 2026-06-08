@@ -788,15 +788,20 @@ impl Fuzzer {
         };
 
         let before = self.relation_graph.edge_count();
+        // Age unconfirmed structural candidates by one pass *before* merging this
+        // pass's confirmations: an edge confirmed here has its decay reset to 0, so
+        // only candidates that went another full pass without confirmation age.
+        self.relation_graph.age_structural_edges();
         phase_b::apply_pass_result(
             &mut self.relation_graph,
             &mut self.length_store,
             result,
         );
         tracing::debug!(
-            "Phase B pass complete: {} edges in graph ({} confirmed)",
+            "Phase B pass complete: {} edges in graph ({} confirmed, {} structural expired)",
             self.relation_graph.edge_count(),
             self.relation_graph.confirmed_edges().count(),
+            self.relation_graph.expired_structural_count(),
         );
         let _ = before;
     }
