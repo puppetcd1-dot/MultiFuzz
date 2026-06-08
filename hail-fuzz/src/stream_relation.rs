@@ -377,6 +377,35 @@ impl StreamRelationGraph {
         }
     }
 
+    /// Back-fill fitted `Relation`s onto all confirmed `Length` edges that share the
+    /// same `(source_addr, target_addr)` address pair but currently have no relation.
+    ///
+    /// `LengthSampleStore::record` only sets the relation on the edge that triggered
+    /// the latest sample insertion.  Sibling edges — confirmed in an earlier pass via a
+    /// different access PC — keep `relation: None` even once the store has accumulated
+    /// enough points to produce a valid fit.  This method propagates those fits so
+    /// every Length edge in the graph benefits from the pooled sample set.
+    ///
+    /// Only `TaintConfirmed` Length edges without a relation are updated; structural
+    /// candidates and edges that already carry a relation are left untouched.
+    pub fn backfill_length_relations(
+        &mut self,
+        relations: impl Iterator<Item = ((StreamKey, StreamKey), Relation)>,
+    ) {
+        for ((src_addr, tgt_addr), relation) in relations {
+            for edge in &mut self.edges {
+                if edge.kind == EdgeKind::Length
+                    && edge.confidence == Confidence::TaintConfirmed
+                    && edge.source.addr == src_addr
+                    && edge.target.addr == tgt_addr
+                    && edge.relation.is_none()
+                {
+                    edge.relation = Some(relation.clone());
+                }
+            }
+        }
+    }
+
     /// Advance the aging clock by one Phase B pass.
     ///
     /// Every edge still at `Confidence::Structural` has its `decay` incremented;
@@ -829,5 +858,70 @@ mod tests {
         assert!(upgraded);
         assert_eq!(g.edge_count(), 1, "no duplicate row for the PC-shifted observation");
         assert_eq!(g.confidence_of(0x5800_0000, 0x5800_0004), Some(Confidence::TaintConfirmed));
+    }
+
+    /// Problem 2 fix: `backfill_length_relations` propagates a fitted relation to all
+    /// confirmed Length edges sharing the same (src_addr, tgt_addr) pair, not just the
+    /// one that happened to trigger the latest `record` call in `apply_pass_result`.
+    ///
+    /// Scenario: two edges for the same address pair (different access PCs) are both
+    /// confirmed as Length, but only edge-1 got the relation from `confirm_edge`.
+    /// After calling `backfill_length_relations`, edge-2 must carry the same relation.
+    #[test]
+    fn backfill_length_relations_fills_sibling_edges() {
+        let src_addr: StreamKey = 0x4001_0000;
+        let tgt_addr: StreamKey = 0x4001_0004;
+
+        let a1 = ctx(0x100, src_addr);
+        let b1 = ctx(0x200, tgt_addr);
+        let a2 = ctx(0x300, src_addr); // same addresses, different PCs
+        let b2 = ctx(0x400, tgt_addr);
+
+        let mut g = StreamRelationGraph::new();
+        g.add_structural_candidates(b1, &[(a1, EdgeKind::Control)]);
+        g.add_structural_candidates(b2, &[(a2, EdgeKind::Control)]);
+
+        // Confirm both as Length but supply a relation only to edge-1.
+        let rel = Relation { kind: RelKind::Identity };
+        g.confirm_edge(a1, b1, EdgeKind::Length, Some(rel.clone()));
+        g.confirm_edge(a2, b2, EdgeKind::Length, None);
+
+        // Before backfill: edge-2 has no relation.
+        let has_rel_before: Vec<bool> = g.governors(tgt_addr)
+            .map(|e| e.relation.is_some())
+            .collect();
+        assert!(has_rel_before.iter().any(|&r| !r), "one sibling should lack a relation before backfill");
+
+        // Backfill from an iterator yielding the fitted relation for this address pair.
+        g.backfill_length_relations(std::iter::once(((src_addr, tgt_addr), rel)));
+
+        // After backfill: both edges must have a relation.
+        for edge in g.governors(tgt_addr) {
+            assert!(
+                edge.relation.is_some(),
+                "all Length edges for address pair must have a relation after backfill"
+            );
+        }
+    }
+
+    /// `backfill_length_relations` must NOT touch Structural or non-Length edges.
+    #[test]
+    fn backfill_length_relations_skips_structural_and_non_length_edges() {
+        let src_addr: StreamKey = 0x4001_0000;
+        let tgt_addr: StreamKey = 0x4001_0004;
+        let a = ctx(0x100, src_addr);
+        let b = ctx(0x200, tgt_addr);
+
+        let mut g = StreamRelationGraph::new();
+        // Structural Control candidate — not yet confirmed.
+        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+
+        let rel = Relation { kind: RelKind::Identity };
+        // Backfill should not touch this edge (it's Structural and Control, not TaintConfirmed Length).
+        g.backfill_length_relations(std::iter::once(((src_addr, tgt_addr), rel)));
+
+        let edge = g.governors(tgt_addr).next().unwrap();
+        assert!(edge.relation.is_none(), "structural Control edge must not be back-filled");
+        assert_eq!(edge.confidence, Confidence::Structural);
     }
 }

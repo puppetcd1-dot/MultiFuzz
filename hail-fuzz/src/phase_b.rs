@@ -173,6 +173,19 @@ impl LengthSampleStore {
         }
         Relation::fit(v)
     }
+
+    /// Iterate over all `(src_addr, tgt_addr)` pairs for which a `Relation` can
+    /// currently be fitted from the accumulated samples.  Used by
+    /// `backfill_length_relations` to propagate fitted relations to all confirmed
+    /// Length edges sharing the same address pair, not just the edge that happened
+    /// to trigger the latest `record` call.
+    pub fn fitted_relations(
+        &self,
+    ) -> impl Iterator<Item = ((StreamKey, StreamKey), Relation)> + '_ {
+        self.samples
+            .iter()
+            .filter_map(|(key, v)| Relation::fit(v).map(|r| (*key, r)))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -604,6 +617,13 @@ pub fn apply_pass_result(
             }
         }
     }
+
+    // Back-propagate fitted relations to ALL confirmed Length edges sharing the
+    // same (src_addr, tgt_addr) pair.  `store.record` fills the relation only on
+    // the edge that triggered the latest `record` call; sibling edges confirmed in
+    // an earlier pass (or via a different access PC) would otherwise keep
+    // `relation: None` even though the store has a valid fit for them.
+    graph.backfill_length_relations(store.fitted_relations());
 }
 
 fn value_size(v: Value) -> u8 {
