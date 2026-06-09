@@ -77,6 +77,22 @@ fn main() {
     }
 }
 
+/// Returns `true` only when an environment variable is set to a *truthy* value.
+///
+/// A bare presence check (`var_os(name).is_some()`) treats `PHASE_B=0` as
+/// "enabled", because the variable is present regardless of its value.  Users
+/// reasonably expect `PHASE_B=0` to *disable* the dynamic taint pass (e.g. to
+/// run a clean baseline).  Treat `0`, `false`, `no`, `off`, and the empty
+/// string (case-insensitive, surrounding whitespace ignored) as disabled;
+/// any other value enables the flag.
+fn env_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"),
+        Err(_) => false,
+    }
+}
+
 fn run() -> anyhow::Result<()> {
     if let Some(path) = std::env::var_os("GENCONFIG") {
         return genconfig::generate_and_save(path.as_ref(), false);
@@ -638,16 +654,16 @@ impl Fuzzer {
         // Ablation control: `DISABLE_RELATION_ASSIST` keeps Phase A extraction (graph still
         // built and dumped) but removes the mutation-weight bias — the "extraction only" arm.
         let mut relation_graph = StreamRelationGraph::new();
-        if std::env::var_os("DISABLE_RELATION_ASSIST").is_some() {
+        if env_enabled("DISABLE_RELATION_ASSIST") || env_enabled("NO_ASSIST") {
             relation_graph.set_assist_enabled(false);
-            tracing::info!("DISABLE_RELATION_ASSIST set — relation graph extracted but not used for mutation");
+            tracing::info!("relation assist disabled — graph extracted but not used for mutation");
         }
 
         // Phase B: install the dynamic-taint block cache + hook when enabled.  Installed here
         // (after the boot run) so only blocks lifted during fuzzing are instrumented — the
         // small boot-path prefix is intentionally uninstrumented (it precedes the first MMIO
         // read, so it has no taint sources).
-        let phase_b = if std::env::var_os("PHASE_B").is_some() {
+        let phase_b = if env_enabled("PHASE_B") {
             let ranges = mmio_flow.mmio_ranges.clone();
             tracing::info!("PHASE_B enabled — installing dynamic taint instrumentation");
             Some(phase_b::install(&mut vm, ranges))
