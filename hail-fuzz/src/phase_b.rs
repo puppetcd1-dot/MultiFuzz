@@ -1,35 +1,5 @@
 //! Phase B — dynamic taint pass for typed stream-relationship classification.
-//!
-//! Phase A (`mmio_flow.rs`) produces *structural* candidates by backward demand
-//! slicing the P-code IR.  It over-approximates control dependence (any MMIO read
-//! feeding any branch on a path to B) and cannot distinguish `Control` from
-//! `Length`/`Stride`, nor confirm that a value genuinely flows.
-//!
-//! Phase B re-executes a seed with byte-granular dynamic taint tracking and
-//! classifies / confirms edges from observed runtime behaviour:
-//!   * the loaded value of an MMIO read reaching **B's load-address register**
-//!     → `Address` (precise value flow);
-//!   * an MMIO value reaching a **branch condition** that gates B → `Control`
-//!     (taint-confirmed; prunes Phase A false positives where taint never
-//!     actually reached the condition);
-//!   * a `Control` whose gating branch is a runtime **loop** (its PC is revisited)
-//!     under which B is read **≥2 times** → `Length` (loop trip count), with an
-//!     optional fitted `Relation` extracted from `(value_A, count_B)` samples.
-//!
-//! ## Engine design
-//!
-//! The engine interprets a block's P-code against a [`ShadowState`], driven by a
-//! [`ConcreteEnv`] that supplies runtime register/memory values.  Decoupling the
-//! concrete value source behind a trait makes the dataflow logic unit-testable
-//! with a mock environment (no live VM required) and backed by the real `Cpu` in
-//! production via [`LiveEnv`].
-//!
-//! The in-VM driver caches each translated block (via a [`CodeInjector`]) and
-//! installs a block-entry `Op::Hook` that runs the engine over the cached block
-//! using the live CPU state.  Because block-entry hooks fire *before* the block
-//! executes (and after all prior blocks have executed), the shadow state stays
-//! consistent with sequential block execution; register reads at block entry are
-//! the correct pre-block values.
+//! Interprets cached P-code blocks against a `ShadowState` driven by live `Cpu` values.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -49,24 +19,14 @@ use crate::{
     taint::{ShadowState, TaintTag},
 };
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Concrete value environment
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Supplies concrete runtime values for the taint interpreter.  Implemented by
-/// [`LiveEnv`] over a real `Cpu` and by a mock in unit tests.
 pub trait ConcreteEnv {
-    /// Concrete value of a register/const at block entry.  `None` if unavailable.
     fn read_value(&mut self, v: Value) -> Option<u64>;
-    /// Read `size` bytes of *non-MMIO* memory at `addr`.  Implementations MUST return
-    /// `None` for MMIO-mapped addresses to avoid input-consuming side effects.
     fn read_mem(&mut self, addr: u64, size: u8) -> Option<u64>;
 }
 
 /// Production `ConcreteEnv` backed by the live emulator CPU.
 pub struct LiveEnv<'a> {
     pub cpu: &'a mut Cpu,
-    /// MMIO ranges — reads from these are suppressed (would consume fuzz input).
     pub mmio_ranges: &'a [Range<u64>],
 }
 
@@ -77,14 +37,11 @@ impl<'a> ConcreteEnv for LiveEnv<'a> {
 
     fn read_mem(&mut self, addr: u64, size: u8) -> Option<u64> {
         use icicle_vm::cpu::mem::perm;
-        // Cortex-M is 32-bit: any address above u32::MAX is a JIT-internal host
-        // pointer stored in a Regs temporary slot — passing it to is_regular_region
-        // causes VecRangeMapCursor to use it as a raw index and panic.
+        // >u32::MAX = JIT host pointer in Regs temp slot; would panic is_regular_region.
         if addr > u64::from(u32::MAX) {
             return None;
         }
-        // Never dispatch to an IoMemory handler from inside the taint hook: that
-        // would alias &mut Cpu and consume a fuzz byte as a side effect.
+        // Don't dispatch into IoMemory — would alias &mut Cpu and consume a fuzz byte.
         let len = size.max(1) as u64;
         if self.mmio_ranges.iter().any(|r| r.contains(&addr))
             || !self.cpu.mem.is_regular_region(addr, len)
@@ -101,33 +58,20 @@ impl<'a> ConcreteEnv for LiveEnv<'a> {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Pass results
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// A single control-channel observation collapsed from one taint pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlEdgeObs {
     pub source: AccessContext,
     pub target: AccessContext,
-    /// The gating branch was a runtime loop and B was read ≥3 times → `Length`.
     pub is_length: bool,
-    /// The condition that gated the branch to B was derived from an equality
-    /// comparison (`IntEqual`/`IntNotEqual`), not a range/arithmetic check.
-    /// Only equality-gated sources produce meaningful discriminants: a value that
-    /// passes `cmd == 3` IS a discriminant; a value that passes `size < 256` is not.
+    /// True when the gating condition was an IntEqual/IntNotEqual (not a range check).
+    /// Only equality-gated values make useful discriminants.
     pub is_eq: bool,
-    /// `(source_value, target_read_count)` for relation fitting, when the source
-    /// value could be observed without MMIO side effects.
     pub sample: Option<(u64, u64)>,
 }
 
-/// Everything one taint pass discovered, ready to be merged into the graph.
 #[derive(Debug, Default, Clone)]
 pub struct PassResult {
-    /// Confirmed `Address` edges (source value reached B's load address).
     pub address_edges: Vec<(AccessContext, AccessContext)>,
-    /// `Control`/`Length` observations (source value reached a branch gating B).
     pub control_edges: Vec<ControlEdgeObs>,
 }
 
@@ -135,111 +79,55 @@ pub struct PassResult {
 // Length-relation sample store (accumulates across passes)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Accumulates `(value_A, count_B)` samples per `Length` edge across multiple
-/// taint passes so a `Relation` can be fitted once enough distinct points exist.
-///
-/// Keyed by `(source_addr, target_addr)` rather than by full `AccessContext` so
-/// that multiple read PCs for the same source→target stream pair pool their samples
-/// into a single list.  Five distinct read sites accessing the same DMA register all
-/// contribute to the same fit, giving the estimator much more statistical power.
+/// Accumulates `(val_A, count_B)` samples per `Length` edge, keyed by address pair
+/// so multiple read-site PCs for the same streams share one pool for better fitting.
 #[derive(Default)]
 pub struct LengthSampleStore {
     samples: HashMap<(StreamKey, StreamKey), Vec<(u64, u64)>>,
 }
 
 impl LengthSampleStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
-    /// Record a sample and return the best `Relation` fit so far (if any).
-    pub fn record(
-        &mut self,
-        edge: (AccessContext, AccessContext),
-        sample: (u64, u64),
-    ) -> Option<Relation> {
-        // Project to address granularity: multiple read-site PCs for the same
-        // stream-level edge share one sample list for better fitting power.
+    pub fn record(&mut self, edge: (AccessContext, AccessContext), sample: (u64, u64)) -> Option<Relation> {
         let key = (edge.0.addr, edge.1.addr);
         let v = self.samples.entry(key).or_default();
-        if !v.contains(&sample) {
-            v.push(sample);
-        }
+        if !v.contains(&sample) { v.push(sample); }
         Relation::fit(v)
     }
 
-    /// Iterate over all `(src_addr, tgt_addr)` pairs for which a `Relation` can
-    /// currently be fitted from the accumulated samples.  Used by
-    /// `backfill_length_relations` to propagate fitted relations to all confirmed
-    /// Length edges sharing the same address pair, not just the edge that happened
-    /// to trigger the latest `record` call.
-    pub fn fitted_relations(
-        &self,
-    ) -> impl Iterator<Item = ((StreamKey, StreamKey), Relation)> + '_ {
-        self.samples
-            .iter()
-            .filter_map(|(key, v)| Relation::fit(v).map(|r| (*key, r)))
+    pub fn fitted_relations(&self) -> impl Iterator<Item = ((StreamKey, StreamKey), Relation)> + '_ {
+        self.samples.iter().filter_map(|(key, v)| Relation::fit(v).map(|r| (*key, r)))
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Taint engine
-// ──────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Default)]
 struct CtrlObs {
-    /// Number of times B was read while this source was a known gating source.
     fires: u64,
-    /// The gating branch was observed as a runtime loop (its PC was revisited).
     is_loop: bool,
-    /// At least one activating branch for this source→target pair was derived from
-    /// an equality comparison (`IntEqual`/`IntNotEqual`).  Only equality-gated
-    /// observations produce useful discriminants; inequality checks (range guards)
-    /// produce noise.
     is_eq: bool,
 }
 
 /// Dynamic taint interpreter operating one block at a time.
 pub struct PhaseBEngine {
     shadow: ShadowState,
-    /// Observed MMIO read sites: load PC → stream key.  Refreshed at arm time.
     read_sites: HashMap<u64, StreamKey>,
     mmio_ranges: Vec<Range<u64>>,
-
-    // ── per-block scratch (negative ids = temporaries, cleared per block) ──
     def_concrete: HashMap<VarId, Option<u64>>,
     def_taint: HashMap<VarId, TaintTag>,
-    /// Varnodes whose value was produced by an `IntEqual` / `IntNotEqual` op
-    /// (or `BoolNot` of one) in the current block.  Used to gate discriminant
-    /// capture on equality-type conditions at block exit.
+    /// VarIds defined by IntEqual/IntNotEqual in current block (gates discriminant capture).
     def_eq_derived: HashSet<VarId>,
     cur_pc: u64,
-
-    // ── per-pass state ──
-    /// Branch PCs at which the tainted condition was derived from an equality
-    /// comparison this pass.  Persists across blocks so MMIO reads attributed
-    /// to that branch later in the pass correctly inherit is_eq.
+    /// Branch PCs where the tainted condition was equality-derived (persists across blocks).
     branch_is_eq: HashSet<u64>,
-
-    // ── per-pass observations ──
-    /// How many times each MMIO context was read this pass.
     target_reads: HashMap<AccessContext, u64>,
-    /// Last concrete value loaded at each MMIO context (for relation samples).
     source_last_val: HashMap<AccessContext, u64>,
-    /// MMIO source reads whose value was not yet observable (production: `LiveEnv`
-    /// suppresses MMIO reads to avoid consuming a fuzz byte).  Each entry is the
-    /// `(context, destination register)` of a source load; the value is captured at
-    /// the *next* block entry, by which point the real CPU has executed the load and
-    /// the register holds the loaded value (block-entry hooks fire pre-execution).
+    /// Source loads whose value LiveEnv deferred; captured at next block entry.
     pending_src_vals: Vec<(AccessContext, VarId)>,
-    /// Tainted branch PCs and how many times each was evaluated tainted (loop ⇒ ≥2).
     branch_visits: HashMap<u64, u64>,
-    /// Accumulated gating `(source, branch_pc)` pairs (taint-confirmed).
     gating: Vec<(AccessContext, u64)>,
     gating_set: HashSet<(AccessContext, u64)>,
-    /// Address-channel confirmations.
     addr_edges: HashSet<(AccessContext, AccessContext)>,
-    /// Control-channel observations keyed by `(source, target)`.
     ctrl_obs: HashMap<(AccessContext, AccessContext), CtrlObs>,
 }
 
@@ -298,19 +186,15 @@ impl PhaseBEngine {
                     return *c;
                 }
                 if vn.id > 0 {
-                    // Mask to the VarNode's declared byte size so that JIT-internal
-                    // 64-bit host pointers stored in Regs temporary slots cannot
-                    // leak through as concrete addresses and reach is_regular_region.
-                    env.read_value(Value::Var(vn))
-                        .map(|val| mask_to_size(val, vn.size))
+                    // Mask so JIT host pointers in Regs temp slots can't escape as addresses.
+                    env.read_value(Value::Var(vn)).map(|val| mask_to_size(val, vn.size))
                 } else {
-                    None // undefined temporary
+                    None
                 }
             }
         }
     }
 
-    /// Taint of an input, consulting in-block defs first, then the shadow registers.
     fn taint_in(&self, v: Value) -> TaintTag {
         match v {
             Value::Const(..) => TaintTag::Clean,
@@ -354,15 +238,12 @@ impl PhaseBEngine {
 
     /// Interpret a single basic block, updating shadow state and observations.
     pub fn run_block(&mut self, block: &Block, env: &mut dyn ConcreteEnv) {
-        // Temporaries do not survive block boundaries; register defs are re-seeded
-        // from `env` (the live block-entry state) on first use within the block.
         self.def_concrete.clear();
         self.def_taint.clear();
         self.def_eq_derived.clear();
         self.cur_pc = block.start;
 
-        // Capture the concrete value of any source MMIO read from the previous block:
-        // its load has now executed, so the destination register holds the loaded value.
+        // Capture source values deferred from previous block (load has now executed).
         if !self.pending_src_vals.is_empty() {
             for (ctx, reg) in std::mem::take(&mut self.pending_src_vals) {
                 if let Some(v) = env.read_value(Value::Var(VarNode::new(reg, 4))) {
@@ -374,15 +255,8 @@ impl PhaseBEngine {
         for stmt in &block.pcode.instructions {
             match stmt.op {
                 Op::InstructionMarker => {
-                    // The first input of InstructionMarker should always be a
-                    // constant (the ARM instruction address), but some ARM/Thumb
-                    // synthetic blocks or rewriter transformations can produce
-                    // a VarNode input.  Calling `.as_u64()` on a non-constant
-                    // panics with "Value is not a constant", which unwinds through
-                    // the `extern "C"` JIT trampoline and aborts.  Use a safe
-                    // pattern match instead: if the input is not a constant, keep
-                    // the previous `cur_pc` value (initialized to `block.start`
-                    // at the top of `run_block`).
+                    // Guard against synthetic blocks with a VarNode input; `.as_u64()`
+                    // would panic through the extern "C" trampoline and abort.
                     if let Value::Const(pc, _) = stmt.inputs.first() {
                         self.cur_pc = pc;
                     }
@@ -394,39 +268,25 @@ impl PhaseBEngine {
                     let addr = self.concrete_in(addr_input, env);
 
                     if let Some(&key) = self.read_sites.get(&self.cur_pc) {
-                        // This load is an MMIO source/target context.
                         let ctx = AccessContext::new(self.cur_pc, key);
                         *self.target_reads.entry(ctx).or_insert(0) += 1;
 
-                        // Address channel: did a prior MMIO value compute this address?
                         let addr_tag = self.taint_in(addr_input);
                         for src in self.contexts_of(&addr_tag) {
-                            if src.addr != ctx.addr {
-                                self.addr_edges.insert((src, ctx));
-                            }
+                            if src.addr != ctx.addr { self.addr_edges.insert((src, ctx)); }
                         }
 
-                        // Control channel: attribute every accumulated gating source.
                         let gating: Vec<(AccessContext, u64)> = self.gating.clone();
                         for (src, bpc) in gating {
-                            if src.addr == ctx.addr {
-                                continue;
-                            }
+                            if src.addr == ctx.addr { continue; }
                             let obs = self.ctrl_obs.entry((src, ctx)).or_default();
                             obs.fires += 1;
-                            if self.branch_visits.get(&bpc).copied().unwrap_or(0) >= 2 {
-                                obs.is_loop = true;
-                            }
-                            if self.branch_is_eq.contains(&bpc) {
-                                obs.is_eq = true;
-                            }
+                            if self.branch_visits.get(&bpc).copied().unwrap_or(0) >= 2 { obs.is_loop = true; }
+                            if self.branch_is_eq.contains(&bpc) { obs.is_eq = true; }
                         }
 
-                        // Capture the loaded value for relation samples.  In production
-                        // `LiveEnv` suppresses MMIO reads (returns `None`) to avoid consuming
-                        // a fuzz byte, so defer to the next block entry where the register
-                        // holds the value; under the mock environment the value is available
-                        // immediately.
+                        // LiveEnv returns None for MMIO reads (avoids consuming fuzz bytes);
+                        // defer value capture to next block entry via pending_src_vals.
                         let loaded = addr.and_then(|a| env.read_mem(a, size));
                         if let Some(v) = loaded {
                             self.source_last_val.insert(ctx, v);
@@ -434,11 +294,9 @@ impl PhaseBEngine {
                             self.pending_src_vals.push((ctx, stmt.output.id));
                         }
 
-                        // Inject the source taint onto the destination register.
                         let tag = self.shadow.source_tag(ctx);
                         self.set_def(stmt.output, loaded, tag);
                     } else {
-                        // Ordinary (non-MMIO) load: dst taint = shadow over the loaded bytes.
                         let tag = match addr {
                             Some(a) => self.shadow.mem_tag_range(a as u32, size as usize),
                             None => TaintTag::Clean,
@@ -491,8 +349,6 @@ impl PhaseBEngine {
                     self.set_def(stmt.output, c, ta.union(&tb));
                 }
 
-                // Equality comparisons: taint propagates AND the output is marked as
-                // equality-derived for discriminant-capture gating at block exit.
                 Op::IntEqual | Op::IntNotEqual => {
                     let ta = self.taint_in(stmt.inputs.first());
                     let tb = self.taint_in(stmt.inputs.second());
@@ -502,7 +358,6 @@ impl PhaseBEngine {
                     }
                 }
 
-                // Other binary/comparison ops: taint propagates, concrete is dropped.
                 Op::IntDiv | Op::IntSignedDiv | Op::IntRem | Op::IntSignedRem
                 | Op::IntRotateLeft | Op::IntRotateRight
                 | Op::IntLess | Op::IntSignedLess | Op::IntLessEqual | Op::IntSignedLessEqual
@@ -518,8 +373,6 @@ impl PhaseBEngine {
                     self.set_def(stmt.output, None, t);
                 }
 
-                // BoolNot of an equality-derived condition is still equality-derived
-                // (it is just the negation of the same equality test).
                 Op::BoolNot => {
                     let t = self.taint_in(stmt.inputs.first());
                     self.set_def(stmt.output, None, t);
@@ -534,12 +387,8 @@ impl PhaseBEngine {
                     }
                 }
 
-                // Calls: conservative kill of r0–r3 (accept under-tainting; see plan Fix 4).
-                Op::PcodeOp(_) => {
-                    self.shadow.kill_call_regs();
-                }
+                Op::PcodeOp(_) => { self.shadow.kill_call_regs(); }
 
-                // Unmodeled ops define their output as untainted/unknown (conservative).
                 _ => {
                     if !stmt.output.is_invalid() {
                         self.set_def(stmt.output, None, TaintTag::Clean);
@@ -548,15 +397,12 @@ impl PhaseBEngine {
             }
         }
 
-        // Control dependence: record a tainted branch condition as a gating source.
         if let Some(Value::Var(cond)) = block.exit.cond() {
             if !cond.is_invalid() {
                 let cond_tag = self.taint_in(Value::Var(cond));
                 if !cond_tag.is_clean() {
                     let bpc = self.cur_pc;
                     *self.branch_visits.entry(bpc).or_insert(0) += 1;
-                    // Track whether this branch condition was derived from an equality
-                    // comparison so MMIO reads that reach here can be flagged is_eq.
                     if self.def_eq_derived.contains(&cond.id) {
                         self.branch_is_eq.insert(bpc);
                     }
@@ -571,16 +417,13 @@ impl PhaseBEngine {
         }
     }
 
-    /// Collapse per-pass observations into a [`PassResult`].
     pub fn finish_pass(&self) -> PassResult {
         let address_edges: Vec<_> = self.addr_edges.iter().copied().collect();
 
         let mut control_edges = Vec::new();
         for (&(src, tgt), obs) in &self.ctrl_obs {
             let count = self.target_reads.get(&tgt).copied().unwrap_or(0);
-            // Require ≥3 reads (not ≥2) to classify as Length: a count of exactly 2
-            // sits on the threshold and flip-flops between passes, leaking stale
-            // relations onto Control edges.  Three reads confirm a genuine loop.
+            // Require ≥3 (not ≥2) to avoid flip-flopping on the threshold.
             let is_length = obs.is_loop && count >= 3 && obs.fires >= 2;
             let sample = self.source_last_val.get(&src).map(|&v| (v, count));
             control_edges.push(ControlEdgeObs {
@@ -613,12 +456,7 @@ pub fn apply_pass_result(
             };
             graph.confirm_edge(obs.source, obs.target, EdgeKind::Length, relation);
         } else if graph.confirm_edge(obs.source, obs.target, EdgeKind::Control, None) {
-            // Capture the gating source value as a discriminant ONLY when:
-            //   (a) the Control edge is structurally backed (confirm_edge returned
-            //       true) — unbacked observations are taint over-approximation noise;
-            //   (b) the condition was derived from an equality comparison (is_eq) —
-            //       a value that passes `cmd == 3` is a real discriminant; a value
-            //       that passes `size < 256` is an arbitrary data point, not useful.
+            // Only equality-gated (cmd==3, not size<256) backed observations record discriminants.
             if obs.is_eq {
                 if let Some((val, _count)) = obs.sample {
                     graph.record_discriminant(obs.source.addr, obs.target.addr, val);
@@ -626,12 +464,6 @@ pub fn apply_pass_result(
             }
         }
     }
-
-    // Back-propagate fitted relations to ALL confirmed Length edges sharing the
-    // same (src_addr, tgt_addr) pair.  `store.record` fills the relation only on
-    // the edge that triggered the latest `record` call; sibling edges confirmed in
-    // an earlier pass (or via a different access PC) would otherwise keep
-    // `relation: None` even though the store has a valid fit for them.
     graph.backfill_length_relations(store.fitted_relations());
 }
 
@@ -670,15 +502,10 @@ fn eval_binop(op: Op, a: u64, b: u64) -> u64 {
 // In-VM driver: block cache + block-entry hook
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Shared state between the block-caching [`CodeInjector`] and the block-entry hook.
 pub struct PhaseBState {
-    /// Cached clean P-code blocks keyed by start address (no injected hook ops).
     blocks: HashMap<u64, Block>,
     engine: PhaseBEngine,
-    /// MMIO ranges, held here (not only in the engine) so the block-entry hook can
-    /// build a `LiveEnv` borrowing this field disjointly from `&mut engine`.
     mmio_ranges: Vec<Range<u64>>,
-    /// When false the hook is a no-op (Phase B is sampled, not always-on).
     armed: bool,
 }
 
@@ -704,21 +531,12 @@ struct PhaseBInjector {
     hook: pcode::HookId,
 }
 
-/// Cap on the cached-block count, bounding memory in long campaigns (~80 MB at
-/// 200 k entries).  Beyond the cap, new blocks are simply not hooked.
+/// Cap on the cached-block count (~80 MB at 200k entries).
 const MAX_BLOCK_CACHE: usize = 200_000;
 
 impl icicle_vm::CodeInjector for PhaseBInjector {
-    /// Hook the group's **entry block only** (`group.blocks.0`) at position 0 and
-    /// mark it modified — mirroring icicle's own `BlockHookInjector` (used by the
-    /// long-stable path tracer).
-    ///
-    /// The previous version looped `group.range()` and injected into *every* block,
-    /// including non-entry sub-blocks whose JIT prologue has not yet established the
-    /// emulated PC.  A hook in such a block makes the JIT emit a wild exit branch
-    /// (`jmp r13`) and stray host-memory writes that corrupt the allocator — the
-    /// SIGSEGV seen after a few minutes.  Restricting to the entry block (exactly
-    /// what the path tracer does) removes that corruption.
+    /// Inject only into the group's entry block (`group.blocks.0`), mirroring
+    /// `BlockHookInjector`.  Injecting into non-entry sub-blocks corrupts the JIT.
     fn inject(&mut self, _cpu: &mut Cpu, group: &BlockGroup, code: &mut BlockTable) {
         let id = group.blocks.0;
         let block = &mut code.blocks[id];
@@ -735,10 +553,8 @@ impl icicle_vm::CodeInjector for PhaseBInjector {
     }
 }
 
-/// Install the Phase B block cache + hook into the VM.  Must be called *before* the
-/// blocks of interest are translated (the injector only runs on newly-lifted blocks).
-///
-/// Returns the shared state handle used to arm/disarm passes and read results.
+/// Install the Phase B block cache and hook into `vm`.
+/// Must be called before the blocks of interest are translated.
 pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBState>> {
     let state = Rc::new(RefCell::new(PhaseBState {
         blocks: HashMap::new(),
@@ -749,9 +565,6 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
 
     let hook_state = state.clone();
     let hook = vm.cpu.add_hook(move |cpu: &mut Cpu, addr: u64| {
-        // `try_borrow_mut`: a (theoretical) re-entrant fire is dropped rather than
-        // panicking across the extern "C" JIT boundary.  `blocks`/`engine`/
-        // `mmio_ranges` are disjoint fields, borrowed together via `&mut *st`.
         let Ok(mut st) = hook_state.try_borrow_mut() else { return; };
         if !st.armed { return; }
         let st = &mut *st;

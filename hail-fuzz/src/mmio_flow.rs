@@ -12,76 +12,31 @@ use crate::{
     stream_relation::{AccessContext, EdgeKind},
 };
 
-/// Traversal depth when crossing function call boundaries.
 const MAX_CALL_LEVELS: usize = 3;
-
-/// Maximum additive multiplier applied to a stream that gates one or more uncovered
-/// frontier branches.  The boost saturates toward `1.0 + FRONTIER_BOOST` as the number
-/// of frontier branches a stream gates grows.
 const FRONTIER_BOOST: f64 = 3.0;
-
-/// Upper bound on the number of frontier branches processed in a single recompute,
-/// keeping the per-recompute overhead controllable on large firmware.
 const MAX_FRONTIER_BRANCHES: usize = 512;
 
-/// Knobs controlling a single backward CFG traversal.  Two call modes are supported:
-///
-///   * **Data-seed mode** (Phase A `candidates_for_new_stream`): the slice is pre-seeded
-///     from B's load-address varnode; the *start* block's own branch fires after B and
-///     therefore must NOT gate B (`inject_start_control = false`), while *predecessor*
-///     branch conditions DO gate the path to B (`inject_pred_control = true`).  A PC
-///     cutoff hides instructions after B's load in the start block.
-///   * **Branch-seed mode** (`candidates_for_branch`): the slice starts empty and the
-///     *start* block's own branch condition is the gate of interest
-///     (`inject_start_control = true`); predecessor branches gate already-covered code
-///     and are deliberately excluded (`inject_pred_control = false`) to keep the
-///     attribution focused on the single frontier branch.  No cutoff (the whole block
-///     precedes its terminating branch).
+/// Knobs for a single backward CFG traversal.
+/// Data-seed mode: `inject_start_control=false`, `inject_pred_control=true`, cutoff=B's PC.
+/// Branch-seed mode: `inject_start_control=true`, `inject_pred_control=false`, cutoff=None.
 struct TraverseCfg {
-    /// PC cutoff applied only to the start block (instructions strictly after this PC are
-    /// ignored).  `None` disables the cutoff.
     start_cutoff: Option<u64>,
-    /// Whether the start block injects its own branch condition into the control channel.
     inject_start_control: bool,
-    /// Whether predecessor blocks inject their branch conditions into the control channel.
     inject_pred_control: bool,
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// DemandSlice
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// Backward demand slice over P-code varnodes.
-///
-/// Starting from a set of "demanded" varnode IDs (the roots of the slice), we
-/// propagate demands backward through block instructions to find all MMIO LOAD
-/// instructions that structurally contribute to those root values.
-///
-/// Two independent provenance channels are tracked so that the extracted edge
-/// can be classified:
-///   * `demanded_data` — varnodes that flow into B's MMIO *address/value*.  MMIO
-///     loads reached through this channel produce `EdgeKind::Address` candidates.
-///   * `demanded_ctrl` — varnodes that flow into a branch condition gating the
-///     path to B.  MMIO loads reached through this channel produce
-///     `EdgeKind::Control` candidates.
-///
-/// Temporaries (VarId < 0) are tracked within a block but NOT carried across
-/// block boundaries, because P-code temporaries are local to a block.
+/// `demanded_data` feeds B's address → Address edges; `demanded_ctrl` feeds branch conditions → Control edges.
+/// Temporaries (VarId < 0) are local to a block and are stripped at block boundaries.
 #[derive(Default, Clone)]
 pub struct DemandSlice {
-    /// Data/address-provenance demands.
     pub demanded_data: HashSet<VarId>,
-    /// Control-provenance demands (branch conditions on the path to B).
     pub demanded_ctrl: HashSet<VarId>,
-    /// MMIO contexts reached via the data channel → Address edges.
     pub sources_addr:  HashSet<AccessContext>,
-    /// MMIO contexts reached via the control channel → Control edges.
     pub sources_ctrl:  HashSet<AccessContext>,
 }
 
 impl DemandSlice {
-    /// Seed the slice from a single varnode (the address operand of B's LOAD),
-    /// which is data/address provenance.
     pub fn seed(vn: pcode::VarNode) -> Self {
         let mut s = Self::default();
         if !vn.is_invalid() {
@@ -90,24 +45,9 @@ impl DemandSlice {
         s
     }
 
-    /// Total number of outstanding demands (both channels).  Used to detect when a
-    /// block's processing changed the slice (fixpoint progress).
-    fn demand_count(&self) -> usize {
-        self.demanded_data.len() + self.demanded_ctrl.len()
-    }
+    fn demand_count(&self) -> usize { self.demanded_data.len() + self.demanded_ctrl.len() }
+    fn source_count(&self) -> usize { self.sources_addr.len() + self.sources_ctrl.len() }
 
-    /// Total number of discovered sources (both channels).
-    fn source_count(&self) -> usize {
-        self.sources_addr.len() + self.sources_ctrl.len()
-    }
-
-    /// Process one block backward.  Demands are expanded through P-code ops along the
-    /// channel they arrived on; MMIO LOADs are recorded as channel-tagged sources.
-    ///
-    /// `inject_control` adds this block's exit branch condition to the control channel.
-    /// It must be `false` for the block that *contains* B (its branch fires after B and
-    /// therefore does not gate B), and `true` for predecessor blocks whose branch gates
-    /// the path toward B.
     pub fn process_block_backward(
         &mut self,
         block: &Block,
@@ -116,28 +56,18 @@ impl DemandSlice {
         inject_control: bool,
         cutoff_pc: Option<u64>,
     ) {
-        // Forward pass to map (instruction_index → current_pc) for source contexts.
         let mut stmt_pcs = vec![block.start; block.pcode.instructions.len()];
         {
             let mut pc = block.start;
             for (i, stmt) in block.pcode.instructions.iter().enumerate() {
                 if stmt.op == Op::InstructionMarker {
-                    if let pcode::Value::Const(addr, _) = stmt.inputs.first() {
-                        pc = addr;
-                    }
+                    if let pcode::Value::Const(addr, _) = stmt.inputs.first() { pc = addr; }
                 }
                 stmt_pcs[i] = pc;
             }
         }
 
-        // Control-dependence: a predecessor block's branch condition gates the path to B.
-        // This MUST be injected *before* the backward pass: the condition is computed inside
-        // *this* block (an ARM CMP/TST sets it just before the conditional branch), so the
-        // backward pass — which runs end→start — needs the condition already in demanded_ctrl
-        // to trace it back to the MMIO read(s) that feed it.  Injecting it *after* the pass
-        // (as before) was a no-op: the pass had already finished, and strip_temporaries() then
-        // deleted the condition (a negative-id temporary) before any predecessor could use it,
-        // so the control channel never activated and no Control edges were ever produced.
+        // Inject branch condition BEFORE the backward pass so it can be traced to MMIO reads.
         if inject_control {
             if let Some(cond) = block.exit.cond() {
                 if let Value::Var(var) = cond {
@@ -148,83 +78,47 @@ impl DemandSlice {
             }
         }
 
-        // Backward pass.
         for (idx, stmt) in block.pcode.instructions.iter().enumerate().rev() {
-            // In the block that *contains* B, ignore every instruction that executes
-            // after B's load (pc > cutoff_pc).  Such instructions run *after* B has
-            // already read, so they cannot be a dependency source of B.  Crucially, a
-            // later redefinition of B's base register in the same block (e.g.
-            // `LDR Rbase, [other_mmio]` placed below B) would otherwise have its output
-            // match the demanded base varnode and be wrongly recorded as an Address
-            // source — the exact false positive observed for streams 0x58000004 and
-            // 0x58000490.
+            // Skip instructions after B's load (cutoff prevents post-B redefs from
+            // matching the demanded base varnode and producing spurious Address edges).
             if let Some(max) = cutoff_pc {
-                if stmt_pcs[idx] > max {
-                    continue;
-                }
+                if stmt_pcs[idx] > max { continue; }
             }
             let out = stmt.output;
-            if out.is_invalid() {
-                continue;
-            }
-            // Which channel(s) demanded this definition?
+            if out.is_invalid() { continue; }
             let in_data = self.demanded_data.remove(&out.id);
             let in_ctrl = self.demanded_ctrl.remove(&out.id);
-            if !in_data && !in_ctrl {
-                continue;
-            }
+            if !in_data && !in_ctrl { continue; }
 
-            // Input varnodes to propagate backward (along the same channel(s)).
             let mut ins: Vec<VarId> = Vec::new();
 
             match stmt.op {
                 Op::Load(_) => {
                     let load_pc = stmt_pcs[idx];
-                    // Register-indirect MMIO reads (`ldr r0,[rN]`) lift to a Load with a *Var*
-                    // address — the lifter never folds the literal-pool base into a constant
-                    // (Op::Load is opaque to const-propagation).  So recognise MMIO loads by
-                    // the runtime-observed (pc → stream address) map, which captures the PC of
-                    // every MMIO read site that has triggered a ReadWatch.
+                    // Identify MMIO loads by the runtime-observed pc→stream map (register-indirect
+                    // loads have a Var address; the lifter never folds the peripheral base to const).
                     if let Some(&saddr) = read_sites.get(&load_pc) {
                         let ctx = AccessContext::new(load_pc, saddr);
                         if std::env::var_os("DUMP_FLOW").is_some() {
-                            eprintln!(
-                                "[flow]   MMIO-load SOURCE recorded: pc={:#x} stream={:#x} \
-                                 out_id={} in_data={} in_ctrl={} \
-                                 (demanded_data={:?} demanded_ctrl={:?})",
-                                load_pc, saddr, out.id, in_data, in_ctrl,
-                                self.demanded_data, self.demanded_ctrl
-                            );
+                            eprintln!("[flow]   SOURCE pc={:#x} stream={:#x} data={} ctrl={}",
+                                load_pc, saddr, in_data, in_ctrl);
                         }
-                        if in_data {
-                            self.sources_addr.insert(ctx);
-                        }
-                        if in_ctrl {
-                            self.sources_ctrl.insert(ctx);
-                        }
+                        if in_data { self.sources_addr.insert(ctx); }
+                        if in_ctrl { self.sources_ctrl.insert(ctx); }
                     }
                     match stmt.inputs.first() {
                         Value::Const(addr, _) => {
-                            // Complementary path: absolute-addressed MMIO (rare; e.g. some PPB
-                            // accesses) where the address survives as a constant.
+                            // Absolute-addressed MMIO (rare; e.g. some PPB accesses).
                             if mmio_ranges.iter().any(|r| r.contains(&addr)) {
                                 let ctx = AccessContext::new(load_pc, addr);
-                                if in_data {
-                                    self.sources_addr.insert(ctx);
-                                }
-                                if in_ctrl {
-                                    self.sources_ctrl.insert(ctx);
-                                }
+                                if in_data { self.sources_addr.insert(ctx); }
+                                if in_ctrl { self.sources_ctrl.insert(ctx); }
                             }
                         }
                         Value::Var(addr_var) if !addr_var.is_invalid() => {
-                            // Trace the address computation chain only for known MMIO loads.
-                            // Non-MMIO loads (flash literal-pool reads like `LDR Rd, =const`,
-                            // RAM struct accesses) are not dependency sources.  Propagating
-                            // their address varnode would eventually demand the PC register
-                            // (ARM PC-relative literal-pool addressing lifts as
-                            // `$tmp = INT_ADD(PC, off); Rd = LOAD($tmp)`), which then spreads
-                            // across the entire CFG and produces spurious Address edges.
+                            // Trace address chain only for known MMIO loads; non-MMIO loads
+                            // (literal-pool, RAM) would pull in the PC register and cause
+                            // spurious Address edges across the entire CFG.
                             if read_sites.contains_key(&load_pc) {
                                 ins.push(addr_var.id);
                             }
@@ -330,11 +224,7 @@ impl DemandSlice {
 // Reverse CFG
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Reverse CFG edge: maps each target block start address to a list of
-/// `(predecessor_block_start, is_call)` pairs.
-///
-/// `is_call = true` means the predecessor's exit was a `BlockExit::Call`, i.e.,
-/// the predecessor is in the *caller* function and called into the target.
+/// Maps each block-start address to its `(predecessor_block_start, is_call)` predecessors.
 type ReverseCfg = HashMap<u64, Vec<(u64, bool)>>;
 
 fn build_reverse_cfg(code: &BlockTable) -> ReverseCfg {
@@ -342,12 +232,9 @@ fn build_reverse_cfg(code: &BlockTable) -> ReverseCfg {
     for block in &code.blocks {
         let is_call = matches!(block.exit, BlockExit::Call { .. });
         for (i, target) in block.exit.targets().enumerate() {
-            // For Call exits: targets()[0] is the callee, targets()[1] is the fall-through
-            // return site. Only the callee edge crosses a function boundary.
             let edge_is_call = is_call && i == 0;
             let target_addr: Option<u64> = match target {
                 Target::External(Value::Const(addr, _)) => Some(addr),
-                // Internal indices address code.blocks directly (intra-function edges).
                 Target::Internal(idx) => code.blocks.get(idx).map(|b| b.start),
                 _ => None,
             };
@@ -359,8 +246,6 @@ fn build_reverse_cfg(code: &BlockTable) -> ReverseCfg {
     reverse
 }
 
-/// Find the block in `code.blocks` that contains `addr`.
-/// Falls back to a linear scan since we don't have ISA mode without the CPU.
 fn find_block_containing(code: &BlockTable, addr: u64) -> Option<&Block> {
     code.blocks.iter().find(|b| b.contains_addr(addr))
 }
@@ -369,18 +254,10 @@ fn find_block_containing(code: &BlockTable, addr: u64) -> Option<&Block> {
 // MmioFlowAnalyzer
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Performs Phase A: structural MMIO dependency inference from the P-code IR.
-///
-/// Called once per newly detected MMIO stream, at the moment the `ReadWatch`
-/// exception fires.  No additional execution is needed — all information comes
-/// from `vm.code` (already translated blocks).
+/// Phase A: backward P-code demand slice for structural MMIO dependency inference.
 pub struct MmioFlowAnalyzer {
-    /// Address ranges that are memory-mapped I/O (reads from these are MMIO sources).
     pub mmio_ranges: Vec<Range<u64>>,
-    /// Maximum number of function-call boundaries to cross when walking backward.
     pub max_call_levels: usize,
-    /// Runtime-observed MMIO read sites: instruction PC → stream address.  Populated at each
-    /// ReadWatch so the structural slice can recognise register-indirect MMIO loads.
     pub mmio_read_sites: HashMap<u64, StreamKey>,
 }
 
@@ -389,7 +266,6 @@ impl MmioFlowAnalyzer {
         Self { mmio_ranges, max_call_levels: MAX_CALL_LEVELS, mmio_read_sites: HashMap::new() }
     }
 
-    /// Standard ARM Cortex-M MMIO range (covers peripheral bus + private peripherals).
     pub fn cortexm_default() -> Self {
         Self::new(vec![
             0x4000_0000..0x6000_0000, // APB/AHB peripherals
@@ -397,18 +273,11 @@ impl MmioFlowAnalyzer {
         ])
     }
 
-    /// Record an observed MMIO read site (called at each ReadWatch).  This is what lets the
-    /// backward slice identify register-indirect MMIO loads as dependency sources.
     pub fn record_read_site(&mut self, pc: u64, addr: StreamKey) {
         self.mmio_read_sites.insert(pc, addr);
     }
 
-    /// Find all MMIO access contexts that structurally govern the access to a new stream B at
-    /// `readwatch_pc`, each classified as an `Address` or `Control` dependency.
-    ///
-    /// Returns an empty vec if no translated blocks are available or no governing contexts
-    /// can be identified.  Each returned `AccessContext` carries the PC at which the source
-    /// MMIO load appears, enabling the caller to build context-level edges in the graph.
+    /// Return all MMIO contexts that structurally govern stream B at `readwatch_pc`.
     pub fn candidates_for_new_stream(
         &self,
         readwatch_pc: u64,
@@ -418,9 +287,6 @@ impl MmioFlowAnalyzer {
             return vec![];
         };
 
-        // Seed the data channel from the LOAD address varnode at `readwatch_pc`.  The control
-        // channel is seeded lazily as predecessor branch conditions are encountered during the
-        // backward traversal, so we always traverse even if the data seed is empty.
         let dbg = std::env::var_os("DUMP_FLOW").is_some();
         if dbg {
             eprintln!(
@@ -446,8 +312,6 @@ impl MmioFlowAnalyzer {
         let reverse_cfg = build_reverse_cfg(code);
 
         // Backward CFG traversal: intra-function (depth=0) + inter-function up to
-        // `max_call_levels` call-stack levels.  Data-seed mode: the start block's own
-        // branch fires after B (no self-gating); predecessor branches gate the path to B.
         let cfg = TraverseCfg {
             start_cutoff: Some(readwatch_pc),
             inject_start_control: false,
@@ -460,10 +324,6 @@ impl MmioFlowAnalyzer {
             eprintln!("[flow] RAW sources_ctrl={:?}", slice.sources_ctrl);
         }
 
-        // A stream cannot govern itself: remove any candidate whose source PC equals
-        // readwatch_pc (the target's own load instruction was discovered as its own source,
-        // which happens when the load's address-input VarId equals its output VarId — e.g.
-        // `LDR Rn,[Rn]` — so the backward slice immediately satisfies its own demand).
         let candidates: Vec<(AccessContext, EdgeKind)> = slice
             .into_candidates()
             .into_iter()
@@ -486,11 +346,8 @@ impl MmioFlowAnalyzer {
         slice: &mut DemandSlice,
         call_depth: usize,
     ) {
-        /// Bound on how many times a single block may be re-processed.  Allows demands that
-        /// arrive late (via another path) to still propagate, while guaranteeing termination.
         const MAX_BLOCK_VISITS: u32 = 8;
 
-        // Work-list of (block_start_addr, call_depth_at_which_this_block_was_reached).
         let mut visits: HashMap<u64, u32> = HashMap::new();
         let mut worklist: Vec<(u64, usize)> = vec![(start_addr, call_depth)];
 
@@ -506,15 +363,8 @@ impl MmioFlowAnalyzer {
                 continue;
             };
 
-            // Whether this block injects its branch condition into the control channel
-            // depends on the traversal mode (see `TraverseCfg`): the start block follows
-            // `inject_start_control`, every predecessor follows `inject_pred_control`.
             let inject_control =
                 if addr == start_addr { cfg.inject_start_control } else { cfg.inject_pred_control };
-
-            // The PC cutoff applies only to the start block (it hides instructions after B's
-            // load in data-seed mode).  Predecessor blocks execute entirely before the start
-            // block, so no cutoff applies to them.
             let cutoff_pc = if addr == start_addr { cfg.start_cutoff } else { None };
 
             if std::env::var_os("DUMP_FLOW").is_some() {
@@ -537,14 +387,10 @@ impl MmioFlowAnalyzer {
             slice.strip_temporaries();
             let after = (slice.demand_count(), slice.source_count());
 
-            // Re-explore predecessors on the first visit, or whenever this block changed the
-            // slice (new demands generated or sources found) so late demands keep flowing.
             if first_visit || before != after {
                 if let Some(predecessors) = reverse_cfg.get(&block.start) {
                     for &(pred_start, is_call) in predecessors {
                         if is_call {
-                            // Crossing a function boundary into the caller — follow only if
-                            // call depth remains.
                             if depth < self.max_call_levels {
                                 worklist.push((pred_start, depth + 1));
                             }
@@ -557,27 +403,13 @@ impl MmioFlowAnalyzer {
         }
     }
 
-    /// Find all MMIO stream addresses whose runtime value controls the conditional branch
-    /// that terminates the block starting at `branch_block_start`.
-    ///
-    /// This is the dual of [`candidates_for_new_stream`]: instead of asking "what governs
-    /// the access to stream B", it asks "what governs the *branch into an uncovered block*".
-    /// The branch condition is seeded directly into the control channel and traced backward
-    /// to the MMIO read(s) that compute it — reusing the same demand-slice machinery.
-    ///
-    /// Returns the deduplicated set of source stream keys (addresses).  Empty when the block
-    /// is not a conditional branch or no MMIO read feeds its condition.
-    ///
-    /// Single-shot entry point (builds the reverse CFG itself).  The batch frontier
-    /// computation uses [`candidates_for_branch_with_cfg`] with a shared reverse CFG.
+    /// Return MMIO stream keys whose value gates the branch at `branch_block_start`.
     #[allow(dead_code)]
     pub fn candidates_for_branch(&self, branch_block_start: u64, code: &BlockTable) -> Vec<StreamKey> {
         let reverse_cfg = build_reverse_cfg(code);
         self.candidates_for_branch_with_cfg(branch_block_start, code, &reverse_cfg)
     }
 
-    /// Like [`candidates_for_branch`] but reuses a pre-built reverse CFG, so a batch
-    /// computation over many frontier branches builds the reverse CFG only once.
     fn candidates_for_branch_with_cfg(
         &self,
         branch_block_start: u64,
@@ -587,13 +419,7 @@ impl MmioFlowAnalyzer {
         let Some(block) = find_block_containing(code, branch_block_start) else {
             return vec![];
         };
-        // Only conditional branches have a gating condition to attribute.
-        if block.exit.cond().is_none() {
-            return vec![];
-        }
-
-        // Branch-seed mode: the start block injects its OWN branch condition; predecessor
-        // branches gate already-covered code and are excluded to keep the attribution sharp.
+        if block.exit.cond().is_none() { return vec![]; }
         let cfg = TraverseCfg {
             start_cutoff: None,
             inject_start_control: true,
@@ -609,8 +435,6 @@ impl MmioFlowAnalyzer {
     }
 }
 
-/// Resolve a block-exit `Target` to a concrete block-start address, if it is a direct
-/// (constant or internal) edge.  Indirect (register) targets return `None`.
 fn target_addr(target: &Target, code: &BlockTable) -> Option<u64> {
     match target {
         Target::External(Value::Const(addr, _)) => Some(*addr),
@@ -619,70 +443,37 @@ fn target_addr(target: &Target, code: &BlockTable) -> Option<u64> {
     }
 }
 
-/// Compute coverage-directed stream weights from the **true coverage frontier**.
-///
-/// A *frontier branch* is a conditional branch in an already-reached block (every block in
-/// `code.blocks` has been lifted, i.e. executed) that has at least one *direct successor
-/// address with no lifted block* — a branch target the fuzzer has never taken.  For each
-/// such branch we trace, via the Phase A backward demand slice, the MMIO stream(s) whose
-/// value controls it.  Streams gating more frontier branches receive a larger boost.
-///
-/// The returned map (`stream key → weight ≥ 1.0`) is superimposed onto the existing stream
-/// weights in `get_stream_weights`, focusing mutation energy precisely on the flows that
-/// gate genuinely uncovered code, rather than on a coarse "rare stream" proxy.
-///
-/// Overhead is bounded: the reverse CFG is built once, and at most `MAX_FRONTIER_BRANCHES`
-/// branches are attributed per call.  Intended to be invoked periodically (throttled on
-/// coverage growth), not per-execution.
+/// Compute per-stream mutation weight boosts from frontier branches (uncovered successors).
+/// Streams gating more frontier branches get a larger saturating boost toward `1+FRONTIER_BOOST`.
 pub fn compute_frontier_stream_weights(
     code: &BlockTable,
     mmio_flow: &MmioFlowAnalyzer,
 ) -> HashMap<StreamKey, f64> {
-    // The set of reached block-start addresses (every lifted block has been executed).
     let reached: HashSet<u64> = code.blocks.iter().map(|b| b.start).collect();
     let reverse_cfg = build_reverse_cfg(code);
 
     let mut counts: HashMap<StreamKey, u32> = HashMap::new();
     let mut processed = 0usize;
     for block in &code.blocks {
-        if processed >= MAX_FRONTIER_BRANCHES {
-            break;
-        }
-        // Only conditional branches can gate entry into an uncovered successor.
-        if block.exit.cond().is_none() {
-            continue;
-        }
-        // Is at least one direct successor uncovered (no lifted block at its address)?
+        if processed >= MAX_FRONTIER_BRANCHES { break; }
+        if block.exit.cond().is_none() { continue; }
         let is_frontier = block.exit.targets().any(|t| {
             target_addr(&t, code).map_or(false, |addr| !reached.contains(&addr))
         });
-        if !is_frontier {
-            continue;
-        }
+        if !is_frontier { continue; }
         processed += 1;
-
         for key in mmio_flow.candidates_for_branch_with_cfg(block.start, code, &reverse_cfg) {
             *counts.entry(key).or_insert(0) += 1;
         }
     }
 
-    // Convert frontier-branch counts to a saturating boost factor: 1 frontier branch already
-    // yields a strong boost, additional ones increase it with diminishing returns toward the
-    // ceiling `1.0 + FRONTIER_BOOST`.
-    counts
-        .into_iter()
+    counts.into_iter()
         .map(|(k, n)| (k, 1.0 + FRONTIER_BOOST * (1.0 - 1.0 / (1.0 + n as f64))))
         .collect()
 }
 
-/// Seed the demand slice from the LOAD instruction at exactly `pc` inside `block`.
-///
-/// For indexed loads like `LDR R0,[R4,#4]` the lifter emits:
-///   `$tmp = INT_ADD(R4, 4);  R0 = LOAD($tmp)`
-/// The address input of the LOAD is `$tmp` (a negative-id temporary).  Because
-/// temporaries don't survive block boundaries they would be stripped immediately,
-/// leaving an empty seed.  `resolve_temporary_in_block` chases the temporary back
-/// through `Copy`/`IntAdd` chains to the underlying named register (R4 here).
+/// Seed the demand slice from the LOAD at `pc`, resolving indexed-load temporaries
+/// (`LDR R0,[R4,#4]` → `$tmp = INT_ADD(R4,4); LOAD($tmp)`) back to the base register.
 fn seed_demand_from_block(block: &Block, pc: u64) -> DemandSlice {
     let mut current_pc = block.start;
     let mut target_idx: Option<usize> = None;
@@ -716,21 +507,9 @@ fn seed_demand_from_block(block: &Block, pc: u64) -> DemandSlice {
     if final_var.is_invalid() { DemandSlice::default() } else { DemandSlice::seed(final_var) }
 }
 
-/// Chase a varnode id backward through `Copy` and `IntAdd` chains within `block`,
-/// looking only at instructions before `up_to_idx`, and return the first
-/// non-temporary (`id >= 0`) varnode reached.
-///
-/// Returns `VarNode::NONE` (id == 0, treated as invalid) when resolution fails.
 fn resolve_temporary_in_block(block: &Block, up_to_idx: usize, tmp_id: VarId) -> VarNode {
-    if tmp_id > 0 {
-        // Named register (positive id) — already resolved.
-        return VarNode::new(tmp_id, 4);
-    }
-    if tmp_id == 0 {
-        // id == 0 is the invalid sentinel.
-        return VarNode::NONE;
-    }
-    // tmp_id < 0: search backward for the defining instruction.
+    if tmp_id > 0 { return VarNode::new(tmp_id, 4); }
+    if tmp_id == 0 { return VarNode::NONE; }
     for stmt in block.pcode.instructions[..up_to_idx].iter().rev() {
         let out = stmt.output;
         if out.is_invalid() || out.id != tmp_id {
@@ -746,15 +525,12 @@ fn resolve_temporary_in_block(block: &Block, up_to_idx: usize, tmp_id: VarId) ->
                 }
             }
             Op::IntAdd | Op::IntSub => {
-                // For `base_reg + immediate_offset` (common ARM indexed load), the first
-                // operand is the base register.  We return the first non-temporary input
-                // found; if both inputs are temporaries we recurse on the first one.
                 let src0 = stmt.inputs.first();
                 let src1 = stmt.inputs.second();
                 for src in [src0, src1] {
                     if let Value::Var(vn) = src {
                         if vn.id > 0 {
-                            return vn; // Named register — done.
+                            return vn;
                         }
                         if vn.id < 0 {
                             let rec = resolve_temporary_in_block(block, up_to_idx, vn.id);

@@ -2,25 +2,15 @@ use hashbrown::HashMap;
 
 use crate::input::StreamKey;
 
-/// Phase B passes an unconfirmed `Structural` edge may survive before it stops
-/// biasing mutation.  Phase A over-approximates control dependence, so a candidate
-/// that this many taint passes never confirmed is treated as a false positive and
-/// soft-expired (its mutation weight drops to neutral).  Confirmed edges never age.
+/// Unconfirmed structural edges soft-expire after this many Phase B passes.
 const STRUCTURAL_EXPIRY: u32 = 8;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // AccessContext
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Fine-grained edge endpoint: the PC at which a stream was accessed together
-/// with the stream's MMIO address.
-///
-/// Streams (fuzzable units) remain address-keyed; edges inside
-/// `StreamRelationGraph` are recorded at context granularity so that
-/// multiple semantic roles of the same address register (e.g. a status
-/// register checked at two different PCs) produce distinct edges.
-/// The mutator-facing API (`governors`, `dependents`) projects those
-/// context edges back onto address-keyed streams.
+/// Edge endpoint: the instruction PC and the stream's MMIO address.
+/// Edges are context-granular; the mutator API projects them back to address-keyed streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AccessContext {
     pub pc:   u64,
@@ -44,17 +34,7 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
-    /// Specificity ranking used to resolve classification conflicts.
-    ///
-    /// A single source value frequently plays several roles for one target: a
-    /// value that indexes B's address (`base + A`) is usually *also* checked in a
-    /// branch (`if (A) …`).  When that happens the observation produces both an
-    /// `Address` and a `Control` confirmation for the same edge.  The more specific
-    /// classification — precise value-into-address flow — must win, so a confirmed
-    /// edge is never downgraded to a coarser kind.  `Address` (exact value flow) >
-    /// `Length` (loop trip count) > `Control` (mere gating).  This mirrors the
-    /// "Address provenance takes priority over Control" rule Phase A already applies
-    /// in `into_candidates`.
+    /// Specificity ranking: Address > Length > Control.  Confirmed edges never downgrade.
     pub fn priority(self) -> u8 {
         match self {
             EdgeKind::Address => 3,
@@ -162,38 +142,23 @@ impl Relation {
 
 #[derive(Debug, Clone)]
 pub struct StreamEdge {
-    /// Access context of the governing stream (source of the dependency).
     pub source:     AccessContext,
-    /// Access context of the governed stream (target of the dependency).
     pub target:     AccessContext,
     pub kind:       EdgeKind,
     pub confidence: Confidence,
-    /// Populated for confirmed Length edges: maps val_A → expected count_B.
+    /// For confirmed Length edges: maps val_A → expected count_B.
     pub relation:   Option<Relation>,
-    /// Discriminating source values for a `Control` edge: `(value, hit_count)` pairs
-    /// observed in Phase B to open the path to the target.  Sorted by hit_count
-    /// descending so the most-confirmed discriminants are injected first.
-    /// Capped at `MAX_DISCRIMINANTS` entries; singletons are evicted to make room
-    /// for recurring values — high hit_count entries are immune to eviction.
+    /// For Control edges: `(value, hit_count)` discriminants, capped at MAX_DISCRIMINANTS.
     pub value_set:  Vec<(u64, u32)>,
-    /// Number of Phase B passes this edge has survived as an unconfirmed
-    /// `Structural` candidate.  Phase A over-approximates control dependence (it
-    /// reaches *every* MMIO read that could feed any gating branch on a path to B),
-    /// so a candidate that many taint passes never confirm is most likely a false
-    /// positive.  `age_structural_edges` increments this once per pass; past
-    /// `STRUCTURAL_EXPIRY` the edge stops biasing mutation (soft expiration).  A
-    /// `TaintConfirmed` edge keeps `decay == 0` and never expires.
+    /// Phase B passes survived as Structural; past STRUCTURAL_EXPIRY the edge soft-expires.
     pub decay:      u32,
 }
 
-/// Directed graph of structural and taint-confirmed relationships between MMIO streams.
 #[derive(Default)]
 pub struct StreamRelationGraph {
     pub edges:    Vec<StreamEdge>,
     outgoing: HashMap<StreamKey, Vec<usize>>,
     incoming: HashMap<StreamKey, Vec<usize>>,
-    /// When false, `mutation_weight_factor` always returns 1.0 so the graph is still
-    /// extracted and dumped but provides no mutation bias (ablation Arm B).
     assist_enabled: bool,
 }
 
@@ -202,21 +167,9 @@ impl StreamRelationGraph {
         Self { assist_enabled: true, ..Default::default() }
     }
 
-    /// Enable/disable the mutation-assistance bias at runtime (extraction is unaffected).
-    pub fn set_assist_enabled(&mut self, enabled: bool) {
-        self.assist_enabled = enabled;
-    }
+    pub fn set_assist_enabled(&mut self, enabled: bool) { self.assist_enabled = enabled; }
+    pub fn assist_enabled(&self) -> bool { self.assist_enabled }
 
-    /// Whether mutation assistance (weighting + coupled mutation) is active.
-    pub fn assist_enabled(&self) -> bool {
-        self.assist_enabled
-    }
-
-    /// Add structurally-inferred candidate edges (Phase A output).
-    ///
-    /// Each source carries its `(PC, address)` context and a structurally-inferred
-    /// `EdgeKind` (`Address` or `Control`).  The index maps are keyed by address so the
-    /// mutator-facing `governors`/`dependents` projection stays O(1).
     pub fn add_structural_candidates(
         &mut self,
         target: AccessContext,
@@ -241,23 +194,9 @@ impl StreamRelationGraph {
         }
     }
 
-    /// Confirm or reclassify an edge from taint analysis (Phase B output).
-    ///
-    /// **Upgrade-only — Phase B never invents relationships.**  Phase A already
-    /// over-approximates dependence (a backward demand slice reaches *every* MMIO
-    /// read that could feed B's address or any gating branch on a path to B), so
-    /// every genuine dependency is already present as a `Structural` candidate.
-    /// Phase B's role is purely to *confirm* (raise confidence) and *reclassify*
-    /// (e.g. `Control` → `Length`) those candidates from observed runtime taint.
-    ///
-    /// Without this restriction the dynamic gating accumulator — which attributes
-    /// every source that ever taints a branch condition to every later MMIO read —
-    /// would materialise an (almost) complete bipartite graph of spurious edges.
-    /// An observation with no structural backing (no candidate with the same
-    /// `source.addr → target.addr`) is therefore a taint over-approximation
-    /// artifact and is dropped.
-    ///
-    /// Returns `true` if at least one structural candidate was upgraded.
+    /// Upgrade-only: confirm or reclassify a structural candidate.
+    /// Observations with no structural backing are dropped (taint over-approximation).
+    /// Returns `true` if at least one candidate was upgraded.
     pub fn confirm_edge(
         &mut self,
         source: AccessContext,
@@ -268,9 +207,7 @@ impl StreamRelationGraph {
         let Some(indices) = self.incoming.get(&target.addr).cloned() else {
             return false;
         };
-
-        // Prefer an exact context match (same PCs on both endpoints): upgrade only
-        // that one edge so distinct semantic roles of an address stay distinct.
+        // Prefer exact context match; fall back to address-pair match.
         for &idx in &indices {
             let edge = &mut self.edges[idx];
             if edge.source == source && edge.target == target {
@@ -278,11 +215,6 @@ impl StreamRelationGraph {
                 return true;
             }
         }
-
-        // Otherwise fall back to an address-pair match: Phase A and Phase B may
-        // attribute an access to different PCs (e.g. the slice anchor vs. the load
-        // marker), but the stream-level relationship is the same.  Upgrade every
-        // structurally-backed candidate for this address pair.
         let mut upgraded = false;
         for &idx in &indices {
             let edge = &mut self.edges[idx];
@@ -294,61 +226,20 @@ impl StreamRelationGraph {
         upgraded
     }
 
-    /// Apply a Phase B confirmation to a single edge, honouring kind priority.
-    ///
-    /// Confidence is always raised to `TaintConfirmed` and `decay` is reset to 0
-    /// (the edge is now backed by observed taint and must never expire).  The
-    /// *kind* is only adopted when it is at least as specific as the edge's current
-    /// kind — a confirmed `Address` edge is never downgraded to `Control`, and a
-    /// confirmed `Length` (loop) edge is never downgraded to `Control`.  This makes
-    /// the order in which `apply_pass_result` confirms address vs control edges
-    /// irrelevant, and stops a value's gating role from erasing its address role.
-    /// Stale fields belonging to a superseded kind are cleared on adoption.
     fn apply_confirmation(edge: &mut StreamEdge, kind: EdgeKind, relation: Option<Relation>) {
-        // Phase B observed real taint between these streams: raise confidence and
-        // reset the aging counter regardless of which channel was observed.
         edge.confidence = Confidence::TaintConfirmed;
         edge.decay = 0;
-
-        // Adopt the new kind only when it is at least as specific as the current
-        // one (Address > Length > Control).  A less-specific observation (e.g. the
-        // gating role of a value that also computes an address) raises confidence
-        // but does not erase the more-specific classification.
+        // Never downgrade: Address > Length > Control.
         if kind.priority() >= edge.kind.priority() {
             edge.kind = kind;
-            // Clear fields belonging to the previous kind so stale data (a relation
-            // from a prior Length phase, or discriminants from a prior Control phase)
-            // cannot persist on the new kind.
-            if kind != EdgeKind::Length {
-                edge.relation = None;
-            } else if relation.is_some() {
-                edge.relation = relation;
-            }
-            if kind != EdgeKind::Control {
-                edge.value_set.clear();
-            }
+            if kind != EdgeKind::Length { edge.relation = None; }
+            else if relation.is_some() { edge.relation = relation; }
+            if kind != EdgeKind::Control { edge.value_set.clear(); }
         }
     }
 
-    /// Record a discriminating source value on confirmed `Control` edge(s)
-    /// `source → target`.
-    ///
-    /// `value` is a concrete value of the source stream that Phase B observed to
-    /// open the path to the target.  Accumulating these across taint passes builds
-    /// the set of known-gating values the mutator can inject directly.  The set is
-    /// bounded so a noisy source (e.g. a counter feeding a comparison) cannot grow
-    /// it without limit.  Only `Control` edges carry discriminants: `Length` edges
-    /// already model the value→count mapping via `relation`, and `Address` edges
-    /// consume the value as an address rather than a discriminator.
-    /// Record a discriminating source value on confirmed `Control` edge(s)
-    /// `source → target`.
-    ///
-    /// Uses frequency-based eviction: each (value, hit_count) pair is maintained
-    /// sorted by recurrence.  When the cap is reached a singleton (hit_count=1) is
-    /// evicted to make room for the new value; if all slots are multi-hit (genuine
-    /// recurring discriminants) the new value is discarded rather than displacing a
-    /// confirmed value.  This prevents one-time random fuzz bytes from permanently
-    /// blocking genuine command-code discriminants that appear repeatedly.
+    /// Record a discriminant value on confirmed Control edges. Frequency-based eviction:
+    /// singletons are displaced before multi-hit entries; discards new values when all slots are multi-hit.
     pub fn record_discriminant(&mut self, source: StreamKey, target: StreamKey, value: u64) {
         const MAX_DISCRIMINANTS: usize = 16;
         let Some(indices) = self.incoming.get(&target).cloned() else {
@@ -356,38 +247,23 @@ impl StreamRelationGraph {
         };
         for idx in indices {
             let edge = &mut self.edges[idx];
-            if edge.source.addr != source || edge.kind != EdgeKind::Control {
-                continue;
-            }
-            // Increment hit count if already present.
+            if edge.source.addr != source || edge.kind != EdgeKind::Control { continue; }
             if let Some(entry) = edge.value_set.iter_mut().find(|(v, _)| *v == value) {
                 entry.1 += 1;
                 continue;
             }
-            // New value: insert directly if under cap.
             if edge.value_set.len() < MAX_DISCRIMINANTS {
                 edge.value_set.push((value, 1));
                 continue;
             }
-            // Cap full: evict the first singleton (hit_count==1) to make room.
-            // If all entries are multi-hit, the new (unconfirmed) value is discarded.
             if let Some(pos) = edge.value_set.iter().position(|(_, c)| *c == 1) {
                 edge.value_set[pos] = (value, 1);
             }
         }
     }
 
-    /// Back-fill fitted `Relation`s onto all confirmed `Length` edges that share the
-    /// same `(source_addr, target_addr)` address pair but currently have no relation.
-    ///
-    /// `LengthSampleStore::record` only sets the relation on the edge that triggered
-    /// the latest sample insertion.  Sibling edges — confirmed in an earlier pass via a
-    /// different access PC — keep `relation: None` even once the store has accumulated
-    /// enough points to produce a valid fit.  This method propagates those fits so
-    /// every Length edge in the graph benefits from the pooled sample set.
-    ///
-    /// Only `TaintConfirmed` Length edges without a relation are updated; structural
-    /// candidates and edges that already carry a relation are left untouched.
+    /// Propagate fitted relations to all TaintConfirmed Length edges sharing the same
+    /// address pair (sibling edges from earlier passes may lack a relation otherwise).
     pub fn backfill_length_relations(
         &mut self,
         relations: impl Iterator<Item = ((StreamKey, StreamKey), Relation)>,
@@ -406,14 +282,6 @@ impl StreamRelationGraph {
         }
     }
 
-    /// Advance the aging clock by one Phase B pass.
-    ///
-    /// Every edge still at `Confidence::Structural` has its `decay` incremented;
-    /// confirmed edges are untouched (they keep `decay == 0`).  Once a structural
-    /// edge's `decay` reaches `STRUCTURAL_EXPIRY` it is considered a Phase A false
-    /// positive and `mutation_weight_factor` stops boosting it, so accumulated
-    /// unconfirmed candidates can no longer skew coverage exploration indefinitely.
-    /// Called once per `run_phase_b_pass`.
     pub fn age_structural_edges(&mut self) {
         for edge in &mut self.edges {
             if edge.confidence == Confidence::Structural && edge.decay < u32::MAX {
@@ -422,7 +290,6 @@ impl StreamRelationGraph {
         }
     }
 
-    /// Number of structural edges that have soft-expired (for diagnostics/telemetry).
     pub fn expired_structural_count(&self) -> usize {
         self.edges
             .iter()
@@ -430,20 +297,17 @@ impl StreamRelationGraph {
             .count()
     }
 
-    /// True if an edge with this exact context pair already exists.
     pub fn has_edge(&self, source: AccessContext, target: AccessContext) -> bool {
         self.incoming
             .get(&target.addr)
             .map_or(false, |v| v.iter().any(|&i| self.edges[i].source == source))
     }
 
-    /// All edges whose target address is `target` (address-keyed projection for mutator).
     pub fn governors(&self, target: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.incoming.get(&target).map(|v| v.as_slice()).unwrap_or(&[]);
         indices.iter().map(|&i| &self.edges[i])
     }
 
-    /// All edges whose source address is `source` (address-keyed projection for mutator).
     pub fn dependents(&self, source: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.outgoing.get(&source).map(|v| v.as_slice()).unwrap_or(&[]);
         indices.iter().map(|&i| &self.edges[i])
@@ -457,36 +321,17 @@ impl StreamRelationGraph {
         self.edges.len()
     }
 
-    /// Mutation-assistance hook: how much more often a stream at `addr` should be mutated
-    /// because it participates in inter-stream dependencies.  Returns a multiplier ≥ 1.0.
-    ///
-    /// Value-flow edges (Address/Length) are robust to address-keying and get the
-    /// strongest boost; Control edges are coarser (the same status register may be checked
-    /// at several sites) and get a smaller boost.  A `TaintConfirmed` edge is weighted above
-    /// a merely `Structural` one.
+    /// Mutation weight multiplier (≥1.0) for a stream participating in dependencies.
     pub fn mutation_weight_factor(&self, addr: StreamKey) -> f64 {
-        if !self.assist_enabled {
-            return 1.0;
-        }
+        if !self.assist_enabled { return 1.0; }
         let mut factor = 1.0_f64;
         for list in [self.incoming.get(&addr), self.outgoing.get(&addr)].into_iter().flatten() {
             for &idx in list {
                 let edge = &self.edges[idx];
-                // Soft-expired structural candidates (never confirmed across many
-                // taint passes) contribute no bias — they are treated as Phase A
-                // false positives so they cannot skew exploration forever.
-                if edge.confidence == Confidence::Structural && edge.decay >= STRUCTURAL_EXPIRY {
-                    continue;
-                }
-                let base = match edge.kind {
-                    EdgeKind::Address | EdgeKind::Length => 4.0,
-                    EdgeKind::Control => 2.0,
-                };
-                let confirmed_bonus = match edge.confidence {
-                    Confidence::TaintConfirmed => 1.5,
-                    Confidence::Structural => 1.0,
-                };
-                factor = factor.max(base * confirmed_bonus);
+                if edge.confidence == Confidence::Structural && edge.decay >= STRUCTURAL_EXPIRY { continue; }
+                let base = match edge.kind { EdgeKind::Address | EdgeKind::Length => 4.0, EdgeKind::Control => 2.0 };
+                let bonus = match edge.confidence { Confidence::TaintConfirmed => 1.5, Confidence::Structural => 1.0 };
+                factor = factor.max(base * bonus);
             }
         }
         factor
@@ -499,7 +344,6 @@ impl StreamRelationGraph {
         })
     }
 
-    /// Serialize the graph as a JSON array of edges (for offline evaluation / debugging).
     pub fn to_json(&self) -> String {
         let mut s = String::from("[\n");
         for (i, e) in self.edges.iter().enumerate() {
@@ -510,8 +354,6 @@ impl StreamRelationGraph {
                 Some(r) => format!("{:?}", r.kind),
                 None => "none".to_string(),
             };
-            // Sort by hit_count descending: most-confirmed discriminants appear first
-            // in the JSON so offline analysis sees the highest-confidence values.
             let values = {
                 let mut sorted = e.value_set.clone();
                 sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
