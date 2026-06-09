@@ -77,20 +77,14 @@ impl<'a> ConcreteEnv for LiveEnv<'a> {
 
     fn read_mem(&mut self, addr: u64, size: u8) -> Option<u64> {
         use icicle_vm::cpu::mem::perm;
-        // CRITICAL: never let a Phase B taint read dispatch to an IoMemory handler.
-        //
-        // We are executing inside a CPU instruction hook, holding `&mut Cpu`.  The
-        // registered MMIO handler (`FuzzwareMmioHandler::read`) reconstructs a second
-        // `&mut Vm` from its raw `uc_ptr` — aliasing the `&mut Cpu` we already hold,
-        // which is undefined behaviour and corrupts the heap.  It would also consume a
-        // fuzz input byte as a side effect.
-        //
-        // The hardcoded `mmio_ranges` list is only the *default* Cortex-M peripheral
-        // window; firmware can map IO outside it.  `is_regular_region` is the
-        // authoritative check that `addr` is plain RAM/ROM (no IoMemory handler), so we
-        // gate on it in addition to the fast-path range check.  Any non-regular or
-        // out-of-range address yields `None` (the value is recovered later from the
-        // destination register via the deferred-capture path).
+        // Cortex-M is 32-bit: any address above u32::MAX is a JIT-internal host
+        // pointer stored in a Regs temporary slot — passing it to is_regular_region
+        // causes VecRangeMapCursor to use it as a raw index and panic.
+        if addr > u64::from(u32::MAX) {
+            return None;
+        }
+        // Never dispatch to an IoMemory handler from inside the taint hook: that
+        // would alias &mut Cpu and consume a fuzz byte as a side effect.
         let len = size.max(1) as u64;
         if self.mmio_ranges.iter().any(|r| r.contains(&addr))
             || !self.cpu.mem.is_regular_region(addr, len)
@@ -295,7 +289,7 @@ impl PhaseBEngine {
     /// Concrete value of an input, consulting in-block defs first, then `env`.
     fn concrete_in(&self, v: Value, env: &mut dyn ConcreteEnv) -> Option<u64> {
         match v {
-            Value::Const(c, _) => Some(c),
+            Value::Const(c, s) => Some(mask_to_size(c, s)),
             Value::Var(vn) => {
                 if vn.is_invalid() {
                     return None;
@@ -304,7 +298,11 @@ impl PhaseBEngine {
                     return *c;
                 }
                 if vn.id > 0 {
+                    // Mask to the VarNode's declared byte size so that JIT-internal
+                    // 64-bit host pointers stored in Regs temporary slots cannot
+                    // leak through as concrete addresses and reach is_regular_region.
                     env.read_value(Value::Var(vn))
+                        .map(|val| mask_to_size(val, vn.size))
                 } else {
                     None // undefined temporary
                 }
