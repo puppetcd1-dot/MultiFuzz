@@ -376,7 +376,18 @@ impl PhaseBEngine {
         for stmt in &block.pcode.instructions {
             match stmt.op {
                 Op::InstructionMarker => {
-                    self.cur_pc = stmt.inputs.first().as_u64();
+                    // The first input of InstructionMarker should always be a
+                    // constant (the ARM instruction address), but some ARM/Thumb
+                    // synthetic blocks or rewriter transformations can produce
+                    // a VarNode input.  Calling `.as_u64()` on a non-constant
+                    // panics with "Value is not a constant", which unwinds through
+                    // the `extern "C"` JIT trampoline and aborts.  Use a safe
+                    // pattern match instead: if the input is not a constant, keep
+                    // the previous `cur_pc` value (initialized to `block.start`
+                    // at the top of `run_block`).
+                    if let Value::Const(pc, _) = stmt.inputs.first() {
+                        self.cur_pc = pc;
+                    }
                 }
 
                 Op::Load(_) => {
@@ -1191,6 +1202,31 @@ mod tests {
         env.regs.insert(5, 0x2a);
         e.run_block(&b2, &mut env);
         assert_eq!(e.source_value(src), Some(0x2a));
+    }
+
+    /// `run_block` must not panic when an `InstructionMarker` has a non-constant
+    /// first input.  This can occur with synthetic ARM/Thumb blocks where the SLEIGH
+    /// lifter or a rewriter emits an InstructionMarker with a `VarNode` address.
+    /// The safe `if let Value::Const` guard must keep the previous `cur_pc` value
+    /// (initialized to `block.start`) rather than calling `as_u64()` and panicking.
+    #[test]
+    fn run_block_does_not_panic_on_non_const_instruction_marker() {
+        let mut e = engine();
+
+        // Build a block where InstructionMarker has a VarNode input (synthesised via
+        // the low-level Instruction constructor) instead of a constant PC.
+        let malformed_marker = pcode::Instruction {
+            op: pcode::Op::InstructionMarker,
+            inputs: pcode::Inputs::new(pcode::Value::Var(VarNode::new(5, 8)), pcode::Value::Const(4, 8)),
+            output: VarNode::NONE,
+        };
+        let mut p = pcode::Block::new();
+        p.instructions.push(malformed_marker);
+        let block = lifter_block(p, 0xdead_0000, 0xdead_0004, BlockExit::invalid());
+        let mut env = MockEnv::new();
+
+        // Must not panic; cur_pc should stay at block.start (0xdead_0000).
+        e.run_block(&block, &mut env);
     }
 
     /// A call (PcodeOp) clears r0–r3 taint so it cannot leak across opaque calls.

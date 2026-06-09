@@ -122,7 +122,9 @@ impl DemandSlice {
             let mut pc = block.start;
             for (i, stmt) in block.pcode.instructions.iter().enumerate() {
                 if stmt.op == Op::InstructionMarker {
-                    pc = stmt.inputs.first().as_u64();
+                    if let pcode::Value::Const(addr, _) = stmt.inputs.first() {
+                        pc = addr;
+                    }
                 }
                 stmt_pcs[i] = pc;
             }
@@ -687,7 +689,9 @@ fn seed_demand_from_block(block: &Block, pc: u64) -> DemandSlice {
 
     for (i, stmt) in block.pcode.instructions.iter().enumerate() {
         if stmt.op == Op::InstructionMarker {
-            current_pc = stmt.inputs.first().as_u64();
+            if let pcode::Value::Const(addr, _) = stmt.inputs.first() {
+                current_pc = addr;
+            }
         }
         if current_pc == pc {
             if let Op::Load(_) = stmt.op {
