@@ -706,67 +706,34 @@ struct PhaseBInjector {
     hook: pcode::HookId,
 }
 
-/// Upper bound on the block cache size in `PhaseBInjector`.
-///
-/// Each cached entry is one P-code `Block` (~400 B average for ARM Cortex-M).
-/// 200 k entries ≈ 80 MB worst-case — acceptable headroom.  When the cache is
-/// full, new blocks get no hook (taint analysis misses them) rather than
-/// growing the heap without bound.
+/// Cap on the cached-block count, bounding memory in long campaigns (~80 MB at
+/// 200 k entries).  Beyond the cap, new blocks are simply not hooked.
 const MAX_BLOCK_CACHE: usize = 200_000;
 
 impl icicle_vm::CodeInjector for PhaseBInjector {
+    /// Hook the group's **entry block only** (`group.blocks.0`) at position 0 and
+    /// mark it modified — mirroring icicle's own `BlockHookInjector` (used by the
+    /// long-stable path tracer).
+    ///
+    /// The previous version looped `group.range()` and injected into *every* block,
+    /// including non-entry sub-blocks whose JIT prologue has not yet established the
+    /// emulated PC.  A hook in such a block makes the JIT emit a wild exit branch
+    /// (`jmp r13`) and stray host-memory writes that corrupt the allocator — the
+    /// SIGSEGV seen after a few minutes.  Restricting to the entry block (exactly
+    /// what the path tracer does) removes that corruption.
     fn inject(&mut self, _cpu: &mut Cpu, group: &BlockGroup, code: &mut BlockTable) {
-        for id in group.range() {
-            let block = &mut code.blocks[id];
+        let id = group.blocks.0;
+        let block = &mut code.blocks[id];
 
-            // Guard: skip blocks already in the cache.  The injector is called for
-            // every newly-lifted block group, but a snapshot-restore cycle can cause
-            // blocks to be re-lifted; without this guard a second Op::Hook would be
-            // inserted, producing invalid P-code that the JIT cannot handle.
-            if self.state.borrow().blocks.contains_key(&block.start) {
-                continue;
-            }
-
-            // Cap the cache to prevent unbounded memory growth in very long runs.
-            if self.state.borrow().blocks.len() >= MAX_BLOCK_CACHE {
-                continue;
-            }
-
-            // Insert the hook AFTER the first InstructionMarker rather than at
-            // position 0.  Icicle's JIT code generator uses `r13` (the icount
-            // register, initialised to `icount_limit` = 10^10 = 0x2540be400) for
-            // exit-branch computation.  When Op::Hook is at position 0 — before any
-            // InstructionMarker — the emulated PC has not been established and the
-            // JIT falls back to `jmp r13`, crashing at address 0x2540be400.  The
-            // same corrupted JIT output also produces spurious host-memory writes
-            // that corrupt glibc malloc metadata.
-            //
-            // If the block has NO InstructionMarker at all (e.g., synthetic helper
-            // blocks or empty lifter artefacts), skip injection entirely rather than
-            // falling back to position 0.  Inserting at position 0 is the root cause
-            // of the JIT crash; skipping is safe because such blocks carry no MMIO
-            // loads that the taint engine needs to observe.
-            let insert_pos = match block
-                .pcode
-                .instructions
-                .iter()
-                .position(|s| s.op == pcode::Op::InstructionMarker)
-            {
-                Some(p) => p + 1,
-                None => continue, // No InstructionMarker — skip rather than crash
-            };
-
-            // Cache the *clean* block (no hook) before modifying the live copy.
-            // `code.modified.insert(id)` is intentionally omitted: this injector runs
-            // only on freshly-lifted (never-yet-JIT-compiled) blocks, so Icicle's own
-            // `code.modified.extend(group.range())` (which runs after all injectors)
-            // already covers them.  Adding a redundant entry would increment
-            // `jit.dead` for blocks that have no JIT code to invalidate, inflating
-            // the dead-block counter and potentially triggering a premature JIT purge
-            // that frees code still reachable via interpreter dispatch tables.
-            self.state.borrow_mut().blocks.insert(block.start, block.clone());
-            block.pcode.instructions.insert(insert_pos, pcode::Op::Hook(self.hook).into());
+        let mut st = self.state.borrow_mut();
+        // Skip if already cached (re-lift after snapshot restore) or cache is full.
+        if st.blocks.contains_key(&block.start) || st.blocks.len() >= MAX_BLOCK_CACHE {
+            return;
         }
+        // Cache the clean block (no hook) for the engine to interpret, then inject.
+        st.blocks.insert(block.start, block.clone());
+        block.pcode.instructions.insert(0, pcode::Op::Hook(self.hook).into());
+        code.modified.insert(id);
     }
 }
 
@@ -784,51 +751,16 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
 
     let hook_state = state.clone();
     let hook = vm.cpu.add_hook(move |cpu: &mut Cpu, addr: u64| {
-        // The hook is called from inside an `extern "C"` JIT trampoline.  Any Rust
-        // panic that escapes this closure crosses an FFI boundary and aborts with
-        // "panic in a function that cannot unwind".
-        //
-        // We use `catch_unwind(AssertUnwindSafe(...))` to intercept ALL panics
-        // (OOM, out-of-range register reads, etc.) before they reach the FFI
-        // boundary.  On a caught panic we log and disarm Phase B for the current
-        // pass; the next pass calls `reset_pass` which wipes all engine state, so
-        // recovery is clean.
-        //
-        // `cpu` is converted to a raw pointer so the `AssertUnwindSafe` closure
-        // can capture it without violating Rust's unwind-safety rules for `&mut T`.
-        // SAFETY: `cpu_raw` is derived from the hook's `cpu` argument and is valid
-        // for the entire duration of this hook invocation.  It is never stored
-        // beyond the closure, and the closure runs before we touch `cpu` again.
-        let cpu_raw: *mut Cpu = cpu;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let cpu = unsafe { &mut *cpu_raw };
-            // `try_borrow_mut` handles the re-entrant case: if the engine is
-            // already processing a block (should not happen, but defensive) the
-            // second fire is silently dropped.
-            let Ok(mut st) = hook_state.try_borrow_mut() else { return; };
-            if !st.armed { return; }
-            // Field-disjoint borrows: `blocks`, `engine`, `mmio_ranges` are
-            // separate fields, so they can be mutably borrowed simultaneously.
-            // The block is cloned to release the `blocks` borrow before calling
-            // `run_block` on `&mut engine`.
-            let st = &mut *st;
-            if let Some(block) = st.blocks.get(&addr) {
-                let block = block.clone();
-                let mut env = LiveEnv { cpu, mmio_ranges: &st.mmio_ranges };
-                st.engine.run_block(&block, &mut env);
-            }
-        }));
-        if result.is_err() {
-            // A panic escaped from the taint engine.  Disarm for the remainder of
-            // this pass so subsequent blocks are no-ops rather than repeated faults.
-            // The next `run_phase_b_pass` call will re-arm after `reset_pass`.
-            tracing::error!(
-                "Phase B: hook panicked at {:#x}; disarming this pass",
-                addr
-            );
-            if let Ok(mut st) = hook_state.try_borrow_mut() {
-                st.set_armed(false);
-            }
+        // `try_borrow_mut`: a (theoretical) re-entrant fire is dropped rather than
+        // panicking across the extern "C" JIT boundary.  `blocks`/`engine`/
+        // `mmio_ranges` are disjoint fields, borrowed together via `&mut *st`.
+        let Ok(mut st) = hook_state.try_borrow_mut() else { return; };
+        if !st.armed { return; }
+        let st = &mut *st;
+        if let Some(block) = st.blocks.get(&addr) {
+            let block = block.clone();
+            let mut env = LiveEnv { cpu, mmio_ranges: &st.mmio_ranges };
+            st.engine.run_block(&block, &mut env);
         }
     });
 
