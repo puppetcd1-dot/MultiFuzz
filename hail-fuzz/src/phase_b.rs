@@ -546,11 +546,30 @@ impl icicle_vm::CodeInjector for PhaseBInjector {
         if st.blocks.contains_key(&entry_start) || st.blocks.len() >= MAX_BLOCK_CACHE {
             return;
         }
-        // Cache the entry block (clean, no hook) for the engine to interpret.
-        st.blocks.insert(entry_start, code.blocks[id].clone());
-        // Inject hook only into the entry block — non-entry injection corrupts the JIT.
+
+        // Insert the hook AFTER the first InstructionMarker, never at position 0.
+        // Icicle's JIT establishes the emulated PC at the InstructionMarker; an
+        // Op::Hook placed before it leaves the PC unestablished, so the JIT falls
+        // back to `jmp r13` and emits spurious host-memory writes that corrupt the
+        // heap/stack (observed as crashes at garbage addresses such as 0x9f9f9f9f).
+        // If the entry block has no InstructionMarker (synthetic/empty lifter
+        // artefact), skip injection entirely — such blocks carry no MMIO loads the
+        // taint engine needs, and position-0 insertion is precisely the crash cause.
         let entry = &mut code.blocks[id];
-        entry.pcode.instructions.insert(0, pcode::Op::Hook(self.hook).into());
+        let insert_pos = match entry
+            .pcode
+            .instructions
+            .iter()
+            .position(|s| s.op == pcode::Op::InstructionMarker)
+        {
+            Some(p) => p + 1,
+            None => return,
+        };
+
+        // Cache the *clean* (pre-hook) entry block for the engine to interpret.
+        st.blocks.insert(entry_start, entry.clone());
+        // Inject hook only into the entry block — non-entry injection corrupts the JIT.
+        entry.pcode.instructions.insert(insert_pos, pcode::Op::Hook(self.hook).into());
         code.modified.insert(id);
     }
 }
