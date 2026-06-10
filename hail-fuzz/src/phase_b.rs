@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use hashbrown::{HashMap, HashSet};
 use icicle_vm::{
-    cpu::lifter::Block,
+    cpu::lifter::{Block, BlockExit, Target},
     cpu::{BlockGroup, Cpu},
     BlockTable, Vm,
 };
@@ -100,6 +100,11 @@ impl LengthSampleStore {
         self.samples.iter().filter_map(|(key, v)| Relation::fit(v).map(|r| (*key, r)))
     }
 }
+
+/// Upper bound on sub-block steps interpreted per group, guarding against an
+/// intra-group back-edge looping forever.  Groups are small (a handful of
+/// sub-blocks per guest instruction), so this is never reached in practice.
+const MAX_GROUP_STEPS: usize = 256;
 
 #[derive(Debug, Clone, Default)]
 struct CtrlObs {
@@ -237,11 +242,89 @@ impl PhaseBEngine {
     // ── block interpretation ───────────────────────────────────────────────────
 
     /// Interpret a single basic block, updating shadow state and observations.
+    ///
+    /// Resets per-block definition state, then interprets the block standalone.
+    /// For multi-block groups use [`Self::run_group`], which preserves definition
+    /// state across the group's internal sub-blocks.  The production driver always
+    /// goes through `run_group`; this single-block entry point is retained for
+    /// unit tests and standalone interpretation.
+    #[allow(dead_code)]
     pub fn run_block(&mut self, block: &Block, env: &mut dyn ConcreteEnv) {
+        self.begin_block(block.start, env);
+        self.interpret_block(block, env);
+    }
+
+    /// Interpret a whole `BlockGroup` by following its internal control flow.
+    ///
+    /// The JIT only fires the entry-block hook (injecting `Op::Hook` into a
+    /// non-entry sub-block corrupts the JIT), so the engine must itself walk the
+    /// group's remaining sub-blocks to observe taint that flows through P-code
+    /// generated past an internal branch (ARM IT-blocks, divide zero-checks,
+    /// multi-register loads, etc.).
+    ///
+    /// `base` is the global block index of `blocks[0]` (i.e. `group.blocks.0`),
+    /// used to translate `Target::Internal(global_idx)` into a position in
+    /// `blocks`.  Definition state (`def_concrete`/`def_taint`) is cleared once at
+    /// group entry and then carried across sub-blocks, so a value a sub-block
+    /// computes is visible to the sub-blocks that consume it (the live CPU still
+    /// holds only the group-entry register state at this point).
+    ///
+    /// Only the sub-block the real CPU would take is interpreted: each internal
+    /// branch is resolved by evaluating its condition concretely.  If a condition
+    /// cannot be resolved concretely, or control leaves the group (Call/Return/an
+    /// external target), interpretation stops — an accepted under-taint, never a
+    /// guess down an untaken path (which would manufacture spurious edges).
+    pub fn run_group(&mut self, blocks: &[Block], base: usize, env: &mut dyn ConcreteEnv) {
+        let Some(first) = blocks.first() else { return };
+        self.begin_block(first.start, env);
+
+        let mut pos = 0usize;
+        for _ in 0..MAX_GROUP_STEPS {
+            let block = &blocks[pos];
+            self.interpret_block(block, env);
+
+            let next = match &block.exit {
+                BlockExit::Jump { target } => {
+                    Self::internal_pos(target, base, blocks.len())
+                }
+                BlockExit::Branch { cond, target, fallthrough } => {
+                    match self.concrete_in(*cond, env) {
+                        Some(0) => Self::internal_pos(fallthrough, base, blocks.len()),
+                        Some(_) => Self::internal_pos(target, base, blocks.len()),
+                        // Non-concrete condition: we can't know the CPU's path.
+                        None => None,
+                    }
+                }
+                // Call/Return transfer control out of the group.
+                BlockExit::Call { .. } | BlockExit::Return { .. } => None,
+            };
+
+            match next {
+                Some(p) => pos = p,
+                None => break,
+            }
+        }
+    }
+
+    /// Translate a `Target::Internal(global_idx)` into a position within the
+    /// captured group slice, or `None` if it leaves the group / isn't internal.
+    fn internal_pos(target: &Target, base: usize, len: usize) -> Option<usize> {
+        match target {
+            Target::Internal(global) => {
+                let p = global.checked_sub(base)?;
+                (p < len).then_some(p)
+            }
+            _ => None,
+        }
+    }
+
+    /// Reset per-block definition state and capture any source values deferred
+    /// from the previous group/block (their loads have now executed on the CPU).
+    fn begin_block(&mut self, start: u64, env: &mut dyn ConcreteEnv) {
         self.def_concrete.clear();
         self.def_taint.clear();
         self.def_eq_derived.clear();
-        self.cur_pc = block.start;
+        self.cur_pc = start;
 
         // Capture source values deferred from previous block (load has now executed).
         if !self.pending_src_vals.is_empty() {
@@ -251,7 +334,13 @@ impl PhaseBEngine {
                 }
             }
         }
+    }
 
+    /// Interpret one block's P-code and its exit gating, WITHOUT resetting the
+    /// per-block definition state (so it can be chained across a group's
+    /// sub-blocks).  `cur_pc` is advanced only by `InstructionMarker`s, so a
+    /// marker-less continuation sub-block keeps the instruction PC of its parent.
+    fn interpret_block(&mut self, block: &Block, env: &mut dyn ConcreteEnv) {
         for stmt in &block.pcode.instructions {
             match stmt.op {
                 Op::InstructionMarker => {
@@ -350,19 +439,40 @@ impl PhaseBEngine {
                 }
 
                 Op::IntEqual | Op::IntNotEqual => {
-                    let ta = self.taint_in(stmt.inputs.first());
-                    let tb = self.taint_in(stmt.inputs.second());
-                    self.set_def(stmt.output, None, ta.union(&tb));
+                    let a = stmt.inputs.first();
+                    let b = stmt.inputs.second();
+                    let ta = self.taint_in(a);
+                    let tb = self.taint_in(b);
+                    let size = value_size(a);
+                    let c = match (self.concrete_in(a, env), self.concrete_in(b, env)) {
+                        (Some(x), Some(y)) => eval_cmp(stmt.op, x, y, size),
+                        _ => None,
+                    };
+                    self.set_def(stmt.output, c, ta.union(&tb));
                     if !stmt.output.is_invalid() {
                         self.def_eq_derived.insert(stmt.output.id);
                     }
                 }
 
-                Op::IntDiv | Op::IntSignedDiv | Op::IntRem | Op::IntSignedRem
-                | Op::IntRotateLeft | Op::IntRotateRight
-                | Op::IntLess | Op::IntSignedLess | Op::IntLessEqual | Op::IntSignedLessEqual
+                Op::IntLess | Op::IntSignedLess | Op::IntLessEqual | Op::IntSignedLessEqual
                 | Op::IntCarry | Op::IntSignedCarry | Op::IntSignedBorrow | Op::BoolAnd
                 | Op::BoolOr | Op::BoolXor => {
+                    let a = stmt.inputs.first();
+                    let b = stmt.inputs.second();
+                    let ta = self.taint_in(a);
+                    let tb = self.taint_in(b);
+                    let size = value_size(a);
+                    // Concretely resolve comparison/boolean ops so internal branch
+                    // conditions can be evaluated by `run_group`.
+                    let c = match (self.concrete_in(a, env), self.concrete_in(b, env)) {
+                        (Some(x), Some(y)) => eval_cmp(stmt.op, x, y, size),
+                        _ => None,
+                    };
+                    self.set_def(stmt.output, c, ta.union(&tb));
+                }
+
+                Op::IntDiv | Op::IntSignedDiv | Op::IntRem | Op::IntSignedRem
+                | Op::IntRotateLeft | Op::IntRotateRight => {
                     let ta = self.taint_in(stmt.inputs.first());
                     let tb = self.taint_in(stmt.inputs.second());
                     self.set_def(stmt.output, None, ta.union(&tb));
@@ -374,8 +484,10 @@ impl PhaseBEngine {
                 }
 
                 Op::BoolNot => {
-                    let t = self.taint_in(stmt.inputs.first());
-                    self.set_def(stmt.output, None, t);
+                    let src = stmt.inputs.first();
+                    let t = self.taint_in(src);
+                    let c = self.concrete_in(src, env).map(|v| (v == 0) as u64);
+                    self.set_def(stmt.output, c, t);
                     if !stmt.output.is_invalid() {
                         let input_is_eq = match stmt.inputs.first() {
                             Value::Var(vn) => self.def_eq_derived.contains(&vn.id),
@@ -498,12 +610,62 @@ fn eval_binop(op: Op, a: u64, b: u64) -> u64 {
     }
 }
 
+/// Sign-extend the low `size` bytes of `v` to a full `i64`.
+fn sign_extend(v: u64, size: u8) -> i64 {
+    let bits = (size as u32) * 8;
+    if bits == 0 || bits >= 64 {
+        return v as i64;
+    }
+    let shift = 64 - bits;
+    ((v << shift) as i64) >> shift
+}
+
+/// Concretely evaluate a comparison/boolean P-code op to `0` or `1`, given the
+/// operand `size` (in bytes) needed for signed comparisons and carry/borrow.
+/// Returns `None` for ops this evaluator does not model (div/rem/rotate), whose
+/// concrete value is left unknown.  Inputs are assumed already masked to `size`.
+fn eval_cmp(op: Op, a: u64, b: u64, size: u8) -> Option<u64> {
+    let bits = (size as u32) * 8;
+    let r = match op {
+        Op::IntEqual => a == b,
+        Op::IntNotEqual => a != b,
+        Op::IntLess => a < b,
+        Op::IntLessEqual => a <= b,
+        Op::IntSignedLess => sign_extend(a, size) < sign_extend(b, size),
+        Op::IntSignedLessEqual => sign_extend(a, size) <= sign_extend(b, size),
+        Op::IntCarry => bits < 64 && ((a as u128 + b as u128) >> bits) != 0,
+        Op::IntSignedCarry => {
+            let s = sign_extend(a, size) as i128 + sign_extend(b, size) as i128;
+            let r = sign_extend(a.wrapping_add(b), size) as i128;
+            s != r
+        }
+        Op::IntSignedBorrow => {
+            let s = sign_extend(a, size) as i128 - sign_extend(b, size) as i128;
+            let r = sign_extend(a.wrapping_sub(b), size) as i128;
+            s != r
+        }
+        Op::BoolAnd => (a != 0) && (b != 0),
+        Op::BoolOr => (a != 0) || (b != 0),
+        Op::BoolXor => (a != 0) ^ (b != 0),
+        _ => return None,
+    };
+    Some(r as u64)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // In-VM driver: block cache + block-entry hook
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// A cached `BlockGroup`: the entry address maps to all its sub-blocks (clean,
+/// pre-hook) plus the global index of the first sub-block, so the engine can
+/// follow internal `Target::Internal` edges when the entry-block hook fires.
+struct CachedGroup {
+    base: usize,
+    blocks: Vec<Block>,
+}
+
 pub struct PhaseBState {
-    blocks: HashMap<u64, Block>,
+    blocks: HashMap<u64, CachedGroup>,
     engine: PhaseBEngine,
     mmio_ranges: Vec<Range<u64>>,
     armed: bool,
@@ -566,9 +728,15 @@ impl icicle_vm::CodeInjector for PhaseBInjector {
             None => return,
         };
 
-        // Cache the *clean* (pre-hook) entry block for the engine to interpret.
-        st.blocks.insert(entry_start, entry.clone());
+        // Cache ALL sub-blocks (clean, pre-hook) so the engine can follow the
+        // group's internal control flow when the entry hook fires; taint flowing
+        // through P-code past an internal branch would otherwise be missed.
+        let base = group.blocks.0;
+        let group_blocks: Vec<Block> = group.range().map(|i| code.blocks[i].clone()).collect();
+        st.blocks.insert(entry_start, CachedGroup { base, blocks: group_blocks });
+
         // Inject hook only into the entry block — non-entry injection corrupts the JIT.
+        let entry = &mut code.blocks[id];
         entry.pcode.instructions.insert(insert_pos, pcode::Op::Hook(self.hook).into());
         code.modified.insert(id);
     }
@@ -589,10 +757,11 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
         let Ok(mut st) = hook_state.try_borrow_mut() else { return; };
         if !st.armed { return; }
         let st = &mut *st;
-        if let Some(block) = st.blocks.get(&addr) {
-            let block = block.clone();
+        if let Some(group) = st.blocks.get(&addr) {
+            let blocks = group.blocks.clone();
+            let base = group.base;
             let mut env = LiveEnv { cpu, mmio_ranges: &st.mmio_ranges };
-            st.engine.run_block(&block, &mut env);
+            st.engine.run_group(&blocks, base, &mut env);
         }
     });
 
@@ -1050,5 +1219,86 @@ mod tests {
         e.run_block(&block, &mut env);
 
         assert!(e.shadow.reg_tag(0).is_clean(), "r0 taint must be killed after an opaque call");
+    }
+
+    /// Build a 3-sub-block group mirroring an internal-branch instruction (e.g. an
+    /// ARM IT-block / divide zero-check):
+    ///   L0 (entry, marker 0x100): r10 = LOAD[mmioA];  r2 = (r10 == 5)
+    ///       Branch r2 → L1 (taken)  else → L2
+    ///   L1 (marker 0x104):  r7 = r4 + r10;  r1 = LOAD[r7]   (B's MMIO read)
+    ///   L2 (marker 0x108):  (fallthrough, empty)
+    /// `mem[mmioA] = a_val` makes the branch condition concrete so `run_group`
+    /// knows which sub-block the CPU took.
+    fn it_block_group(a_val: u64) -> (Vec<Block>, MockEnv) {
+        let mmio_a = 0x5800_0000u64;
+        let b_base = 0x2000_0000u64; // regular RAM, not MMIO
+
+        let mut p0 = pcode::Block::new();
+        p0.push(marker(0x100));
+        p0.push((reg(10), Op::Load(0), reg(5)));        // r10 = LOAD[mmioA]
+        p0.push((reg(2), Op::IntEqual, reg(10), Value::Const(5, 4)));
+        let b0 = lifter_block(p0, 0x100, 0x104, BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::Internal(1),
+            fallthrough: Target::Internal(2),
+        });
+
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x104));
+        p1.push((reg(7), Op::IntAdd, reg(4), reg(10)));  // B addr = base + mmioA value
+        p1.push((reg(1), Op::Load(0), reg(7)));          // r1 = LOAD[r7]  (B's MMIO read)
+        let b1 = lifter_block(p1, 0x104, 0x108, BlockExit::Jump { target: Target::Internal(2) });
+
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x108));
+        let b2 = lifter_block(p2, 0x108, 0x10c, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(5, mmio_a);
+        env.regs.insert(4, b_base);
+        env.mem.insert(mmio_a, a_val); // makes r10 (and thus the branch) concrete
+        (vec![b0, b1, b2], env)
+    }
+
+    /// `run_group` must interpret a non-entry sub-block reached by a taken internal
+    /// branch, so taint flowing through it (B's address derived from A) is observed.
+    #[test]
+    fn group_replay_observes_taken_internal_subblock() {
+        let mut e = engine();
+        e.read_sites.insert(0x100, 0x5800_0000); // stream A
+        e.read_sites.insert(0x104, 0x5800_0004); // stream B (in non-entry sub-block L1)
+
+        let (blocks, mut env) = it_block_group(5); // 5 == 5 → branch taken → L1 runs
+        e.run_group(&blocks, 0, &mut env);
+        let result = e.finish_pass();
+
+        let src = AccessContext::new(0x100, 0x5800_0000);
+        let tgt = AccessContext::new(0x104, 0x5800_0004);
+        assert!(
+            result.address_edges.contains(&(src, tgt)),
+            "Address edge A→B from the taken sub-block must be observed, got {:?}",
+            result.address_edges
+        );
+    }
+
+    /// `run_group` must NOT interpret the untaken sub-block: doing so would
+    /// manufacture a spurious edge from P-code the CPU never executed.
+    #[test]
+    fn group_replay_skips_untaken_internal_subblock() {
+        let mut e = engine();
+        e.read_sites.insert(0x100, 0x5800_0000); // stream A
+        e.read_sites.insert(0x104, 0x5800_0004); // stream B (in non-entry sub-block L1)
+
+        let (blocks, mut env) = it_block_group(7); // 7 != 5 → fallthrough → L1 skipped
+        e.run_group(&blocks, 0, &mut env);
+        let result = e.finish_pass();
+
+        let src = AccessContext::new(0x100, 0x5800_0000);
+        let tgt = AccessContext::new(0x104, 0x5800_0004);
+        assert!(
+            !result.address_edges.contains(&(src, tgt)),
+            "untaken sub-block must not be interpreted, but produced edge {:?}",
+            result.address_edges
+        );
     }
 }
