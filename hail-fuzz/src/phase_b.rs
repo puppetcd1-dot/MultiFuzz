@@ -503,7 +503,7 @@ fn eval_binop(op: Op, a: u64, b: u64) -> u64 {
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub struct PhaseBState {
-    blocks: HashMap<u64, Vec<Block>>,
+    blocks: HashMap<u64, Block>,
     engine: PhaseBEngine,
     mmio_ranges: Vec<Range<u64>>,
     armed: bool,
@@ -546,9 +546,8 @@ impl icicle_vm::CodeInjector for PhaseBInjector {
         if st.blocks.contains_key(&entry_start) || st.blocks.len() >= MAX_BLOCK_CACHE {
             return;
         }
-        // Cache ALL sub-blocks (clean, no hook) so the engine interprets the full group.
-        let group_blocks: Vec<Block> = group.range().map(|i| code.blocks[i].clone()).collect();
-        st.blocks.insert(entry_start, group_blocks);
+        // Cache the entry block (clean, no hook) for the engine to interpret.
+        st.blocks.insert(entry_start, code.blocks[id].clone());
         // Inject hook only into the entry block — non-entry injection corrupts the JIT.
         let entry = &mut code.blocks[id];
         entry.pcode.instructions.insert(0, pcode::Op::Hook(self.hook).into());
@@ -571,12 +570,10 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
         let Ok(mut st) = hook_state.try_borrow_mut() else { return; };
         if !st.armed { return; }
         let st = &mut *st;
-        if let Some(blocks) = st.blocks.get(&addr) {
-            let blocks = blocks.clone();
+        if let Some(block) = st.blocks.get(&addr) {
+            let block = block.clone();
             let mut env = LiveEnv { cpu, mmio_ranges: &st.mmio_ranges };
-            for block in &blocks {
-                st.engine.run_block(block, &mut env);
-            }
+            st.engine.run_block(&block, &mut env);
         }
     });
 
