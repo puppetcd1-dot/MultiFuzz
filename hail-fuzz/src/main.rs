@@ -666,7 +666,22 @@ impl Fuzzer {
         let phase_b = if env_enabled("PHASE_B") {
             let ranges = mmio_flow.mmio_ranges.clone();
             tracing::info!("PHASE_B enabled — installing dynamic taint instrumentation");
-            Some(phase_b::install(&mut vm, ranges))
+            let pb_state = phase_b::install(&mut vm, ranges);
+            for (env_var, summary) in [
+                ("PHASE_B_MEMCPY_ADDR",       phase_b::FuncSummary::Memcpy),
+                ("PHASE_B_MEMMOVE_ADDR",      phase_b::FuncSummary::Memmove),
+                ("PHASE_B_MEMSET_ADDR",       phase_b::FuncSummary::Memset),
+                ("PHASE_B_STRLEN_ADDR",       phase_b::FuncSummary::Strlen),
+                ("PHASE_B_PASSTHROUGH_ADDR",  phase_b::FuncSummary::Passthrough),
+            ] {
+                if let Ok(val) = std::env::var(env_var) {
+                    if let Ok(addr) = u64::from_str_radix(val.trim_start_matches("0x"), 16) {
+                        pb_state.borrow_mut().register_summary(addr, summary);
+                        tracing::info!("Phase B: registered {summary:?} summary at {addr:#x}");
+                    }
+                }
+            }
+            Some(pb_state)
         } else {
             None
         };

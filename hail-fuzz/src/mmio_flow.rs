@@ -259,11 +259,42 @@ pub struct MmioFlowAnalyzer {
     pub mmio_ranges: Vec<Range<u64>>,
     pub max_call_levels: usize,
     pub mmio_read_sites: HashMap<u64, StreamKey>,
+    analyzed_contexts: HashMap<(StreamKey, u64), usize>,
+}
+
+const REANALYZE_BLOCK_DELTA: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseATrigger {
+    pub run_slice: bool,
+    pub first_seen: bool,
 }
 
 impl MmioFlowAnalyzer {
     pub fn new(mmio_ranges: Vec<Range<u64>>) -> Self {
-        Self { mmio_ranges, max_call_levels: MAX_CALL_LEVELS, mmio_read_sites: HashMap::new() }
+        Self {
+            mmio_ranges,
+            max_call_levels: MAX_CALL_LEVELS,
+            mmio_read_sites: HashMap::new(),
+            analyzed_contexts: HashMap::new(),
+        }
+    }
+
+    pub fn trigger(&mut self, addr: StreamKey, pc: u64, lifted_blocks: usize) -> PhaseATrigger {
+        match self.analyzed_contexts.entry((addr, pc)) {
+            hashbrown::hash_map::Entry::Vacant(e) => {
+                e.insert(lifted_blocks);
+                PhaseATrigger { run_slice: true, first_seen: true }
+            }
+            hashbrown::hash_map::Entry::Occupied(mut e) => {
+                if lifted_blocks >= *e.get() + REANALYZE_BLOCK_DELTA {
+                    e.insert(lifted_blocks);
+                    PhaseATrigger { run_slice: true, first_seen: false }
+                } else {
+                    PhaseATrigger { run_slice: false, first_seen: false }
+                }
+            }
+        }
     }
 
     pub fn cortexm_default() -> Self {
@@ -967,5 +998,44 @@ mod tests {
             weights_covered.get(&stream).is_none(),
             "no boost once every branch target is covered; got {weights_covered:?}"
         );
+    }
+
+    // ── Phase A trigger tests ────────────────────────────────────────────────
+
+    #[test]
+    fn trigger_first_sighting_runs_and_is_first_seen() {
+        let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+        let t = analyzer.trigger(0x5800_0000, 0x100, 50);
+        assert_eq!(t, PhaseATrigger { run_slice: true, first_seen: true });
+    }
+
+    #[test]
+    fn trigger_repeat_without_growth_skips() {
+        let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+        analyzer.trigger(0x5800_0000, 0x100, 50);
+        let t = analyzer.trigger(0x5800_0000, 0x100, 50);
+        assert_eq!(t, PhaseATrigger { run_slice: false, first_seen: false });
+        let t = analyzer.trigger(0x5800_0000, 0x100, 50 + REANALYZE_BLOCK_DELTA - 1);
+        assert_eq!(t, PhaseATrigger { run_slice: false, first_seen: false });
+    }
+
+    #[test]
+    fn trigger_reanalyzes_after_cfg_growth() {
+        let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+        analyzer.trigger(0x5800_0000, 0x100, 50);
+        let t = analyzer.trigger(0x5800_0000, 0x100, 50 + REANALYZE_BLOCK_DELTA);
+        assert_eq!(t, PhaseATrigger { run_slice: true, first_seen: false });
+        let t = analyzer.trigger(0x5800_0000, 0x100, 50 + REANALYZE_BLOCK_DELTA);
+        assert_eq!(t, PhaseATrigger { run_slice: false, first_seen: false });
+    }
+
+    #[test]
+    fn trigger_same_addr_different_pc_is_new_context() {
+        let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+        analyzer.trigger(0x5800_0000, 0x100, 50);
+        let t = analyzer.trigger(0x5800_0000, 0x230, 50);
+        assert_eq!(t, PhaseATrigger { run_slice: true, first_seen: true });
+        let t = analyzer.trigger(0x5800_0004, 0x100, 50);
+        assert_eq!(t, PhaseATrigger { run_slice: true, first_seen: true });
     }
 }

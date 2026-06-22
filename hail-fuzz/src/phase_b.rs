@@ -19,6 +19,19 @@ use crate::{
     taint::{ShadowState, TaintTag},
 };
 
+/// Taint summary for a known library function.
+///
+/// When a `BlockExit::Call` targets a registered address, the engine applies the
+/// corresponding summary instead of conservatively killing r0–r3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuncSummary {
+    Memcpy,
+    Memmove,
+    Memset,
+    Strlen,
+    Passthrough,
+}
+
 pub trait ConcreteEnv {
     fn read_value(&mut self, v: Value) -> Option<u64>;
     fn read_mem(&mut self, addr: u64, size: u8) -> Option<u64>;
@@ -37,14 +50,12 @@ impl<'a> ConcreteEnv for LiveEnv<'a> {
 
     fn read_mem(&mut self, addr: u64, size: u8) -> Option<u64> {
         use icicle_vm::cpu::mem::perm;
-        // >u32::MAX = JIT host pointer in Regs temp slot; would panic is_regular_region.
-        if addr > u64::from(u32::MAX) {
-            return None;
-        }
-        // Don't dispatch into IoMemory — would alias &mut Cpu and consume a fuzz byte.
+        if addr > u64::from(u32::MAX) { return None; }
         let len = size.max(1) as u64;
-        if self.mmio_ranges.iter().any(|r| r.contains(&addr))
-            || !self.cpu.mem.is_regular_region(addr, len)
+        let end = addr.checked_add(len - 1)?;
+        if self.mmio_ranges.iter().any(|r| r.contains(&addr) || r.contains(&end))
+            || self.cpu.mem.get_physical_addr(addr).is_none()
+            || self.cpu.mem.get_physical_addr(end).is_none()
         {
             return None;
         }
@@ -128,12 +139,17 @@ pub struct PhaseBEngine {
     target_reads: HashMap<AccessContext, u64>,
     source_last_val: HashMap<AccessContext, u64>,
     /// Source loads whose value LiveEnv deferred; captured at next block entry.
-    pending_src_vals: Vec<(AccessContext, VarId)>,
+    /// Stores the full output `VarNode` (not just its `VarId`) so the deferred
+    /// read uses the register's true size.
+    pending_src_vals: Vec<(AccessContext, VarNode)>,
     branch_visits: HashMap<u64, u64>,
     gating: Vec<(AccessContext, u64)>,
     gating_set: HashSet<(AccessContext, u64)>,
     addr_edges: HashSet<(AccessContext, AccessContext)>,
     ctrl_obs: HashMap<(AccessContext, AccessContext), CtrlObs>,
+    /// Per-address function summaries.  Not cleared between passes — populated once
+    /// at startup from user configuration (e.g. `PHASE_B_MEMCPY_ADDR` env var).
+    pub(crate) summaries: HashMap<u64, FuncSummary>,
 }
 
 impl PhaseBEngine {
@@ -155,6 +171,7 @@ impl PhaseBEngine {
             gating_set: HashSet::new(),
             addr_edges: HashSet::new(),
             ctrl_obs: HashMap::new(),
+            summaries: HashMap::new(),
         }
     }
 
@@ -239,6 +256,96 @@ impl PhaseBEngine {
         self.source_last_val.get(&ctx).copied()
     }
 
+    // ── call summary helpers ──────────────────────────────────────────────────
+
+    fn concrete_arg_reg(&self, id: i16, size: u8, env: &mut dyn ConcreteEnv) -> Option<u64> {
+        if let Some(c) = self.def_concrete.get(&id) {
+            return *c;
+        }
+        env.read_value(Value::Var(VarNode::new(id, size))).map(|v| mask_to_size(v, size))
+    }
+
+    fn taint_arg_reg(&self, id: i16) -> TaintTag {
+        if let Some(t) = self.def_taint.get(&id) {
+            return t.clone();
+        }
+        self.shadow.reg_tag(id)
+    }
+
+    fn apply_memcpy_summary(&mut self, env: &mut dyn ConcreteEnv) {
+        let dst = self.concrete_arg_reg(0, 4, env);
+        let src = self.concrete_arg_reg(1, 4, env);
+        let n   = self.concrete_arg_reg(2, 4, env).unwrap_or(0) as usize;
+        if let (Some(dst), Some(src)) = (dst, src) {
+            for i in 0..n.min(4096) {
+                let tag = self.shadow.mem_tag(src as u32 + i as u32);
+                if tag.is_clean() {
+                    self.shadow.mem.remove(&(dst as u32 + i as u32));
+                } else {
+                    self.shadow.mem.insert(dst as u32 + i as u32, tag);
+                }
+            }
+        }
+        self.shadow.kill_call_regs();
+    }
+
+    fn apply_memset_summary(&mut self, env: &mut dyn ConcreteEnv) {
+        let dst   = self.concrete_arg_reg(0, 4, env);
+        let n     = self.concrete_arg_reg(2, 4, env).unwrap_or(0) as usize;
+        let c_tag = self.taint_arg_reg(1);
+        if let Some(dst) = dst {
+            self.shadow.set_mem_tag_range(dst as u32, n.min(4096), c_tag);
+        }
+        self.shadow.kill_call_regs();
+    }
+
+    fn apply_strlen_summary(&mut self, env: &mut dyn ConcreteEnv) {
+        let s_ptr = self.concrete_arg_reg(0, 4, env);
+        let s_tag = self.taint_arg_reg(0);
+        let result_tag = if let Some(s) = s_ptr {
+            let mut tag = s_tag;
+            for i in 0..4096u32 {
+                let addr = (s as u32).wrapping_add(i);
+                tag = tag.union(&self.shadow.mem_tag(addr));
+                if env.read_mem(addr as u64, 1).map_or(false, |v| v == 0) {
+                    break;
+                }
+            }
+            tag
+        } else {
+            TaintTag::Clean
+        };
+        self.shadow.kill_call_regs();
+        self.shadow.set_reg_tag(0, result_tag);
+    }
+
+    fn apply_passthrough_summary(&mut self, env: &mut dyn ConcreteEnv) {
+        let in_tag = self.taint_arg_reg(0);
+        let _ = self.concrete_arg_reg(0, 4, env);
+        self.shadow.kill_call_regs();
+        self.shadow.set_reg_tag(0, in_tag);
+    }
+
+    fn handle_call_exit(&mut self, target: Value, env: &mut dyn ConcreteEnv) {
+        let addr = match target {
+            Value::Const(a, _) => a,
+            Value::Var(vn) => match self.concrete_arg_reg(vn.id, vn.size, env) {
+                Some(a) => a,
+                None => {
+                    self.shadow.kill_call_regs();
+                    return;
+                }
+            },
+        };
+        match self.summaries.get(&addr).copied() {
+            Some(FuncSummary::Memcpy | FuncSummary::Memmove) => self.apply_memcpy_summary(env),
+            Some(FuncSummary::Memset)                        => self.apply_memset_summary(env),
+            Some(FuncSummary::Strlen)                        => self.apply_strlen_summary(env),
+            Some(FuncSummary::Passthrough)                   => self.apply_passthrough_summary(env),
+            None                                             => self.shadow.kill_call_regs(),
+        }
+    }
+
     // ── block interpretation ───────────────────────────────────────────────────
 
     /// Interpret a single basic block, updating shadow state and observations.
@@ -295,8 +402,11 @@ impl PhaseBEngine {
                         None => None,
                     }
                 }
-                // Call/Return transfer control out of the group.
-                BlockExit::Call { .. } | BlockExit::Return { .. } => None,
+                BlockExit::Return { .. } => None,
+                BlockExit::Call { target, .. } => {
+                    self.handle_call_exit(*target, env);
+                    None
+                }
             };
 
             match next {
@@ -328,8 +438,8 @@ impl PhaseBEngine {
 
         // Capture source values deferred from previous block (load has now executed).
         if !self.pending_src_vals.is_empty() {
-            for (ctx, reg) in std::mem::take(&mut self.pending_src_vals) {
-                if let Some(v) = env.read_value(Value::Var(VarNode::new(reg, 4))) {
+            for (ctx, var_node) in std::mem::take(&mut self.pending_src_vals) {
+                if let Some(v) = env.read_value(Value::Var(var_node)) {
                     self.source_last_val.entry(ctx).or_insert(v);
                 }
             }
@@ -380,7 +490,7 @@ impl PhaseBEngine {
                         if let Some(v) = loaded {
                             self.source_last_val.insert(ctx, v);
                         } else if stmt.output.id > 0 {
-                            self.pending_src_vals.push((ctx, stmt.output.id));
+                            self.pending_src_vals.push((ctx, stmt.output));
                         }
 
                         let tag = self.shadow.source_tag(ctx);
@@ -417,7 +527,7 @@ impl PhaseBEngine {
                     let src = stmt.inputs.first();
                     let t = self.taint_in(src);
                     let c = self.concrete_in(src, env).map(|v| {
-                        let shifted = v >> (offset as u64 * 8);
+                        let shifted = v.checked_shr((offset as u32) * 8).unwrap_or(0);
                         mask_to_size(shifted, stmt.output.size)
                     });
                     self.set_def(stmt.output, c, t);
@@ -686,6 +796,9 @@ impl PhaseBState {
     pub fn finish_pass(&self) -> PassResult {
         self.engine.finish_pass()
     }
+    pub fn register_summary(&mut self, addr: u64, summary: FuncSummary) {
+        self.engine.summaries.insert(addr, summary);
+    }
 }
 
 struct PhaseBInjector {
@@ -754,14 +867,27 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
 
     let hook_state = state.clone();
     let hook = vm.cpu.add_hook(move |cpu: &mut Cpu, addr: u64| {
-        let Ok(mut st) = hook_state.try_borrow_mut() else { return; };
-        if !st.armed { return; }
-        let st = &mut *st;
-        if let Some(group) = st.blocks.get(&addr) {
-            let blocks = group.blocks.clone();
-            let base = group.base;
-            let mut env = LiveEnv { cpu, mmio_ranges: &st.mmio_ranges };
-            st.engine.run_group(&blocks, base, &mut env);
+        let cpu_raw: *mut Cpu = cpu;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cpu = unsafe { &mut *cpu_raw };
+            let Ok(mut st) = hook_state.try_borrow_mut() else { return; };
+            if !st.armed { return; }
+            let st = &mut *st;
+            if let Some(group) = st.blocks.get(&addr) {
+                let blocks = group.blocks.clone();
+                let base = group.base;
+                let mut env = LiveEnv { cpu, mmio_ranges: &st.mmio_ranges };
+                st.engine.run_group(&blocks, base, &mut env);
+            }
+        }));
+        if result.is_err() {
+            tracing::error!(
+                "Phase B: hook panicked at {:#x}; disarming this pass",
+                addr
+            );
+            if let Ok(mut st) = hook_state.try_borrow_mut() {
+                st.set_armed(false);
+            }
         }
     });
 
@@ -1300,5 +1426,145 @@ mod tests {
             "untaken sub-block must not be interpreted, but produced edge {:?}",
             result.address_edges
         );
+    }
+
+    /// `BlockExit::Call` to an unknown function kills r0–r3.
+    #[test]
+    fn call_exit_kills_regs_for_unknown_function() {
+        let mut e = engine();
+        let mut t0 = TaintTag::Clean; t0.set_stream(0);
+        let mut t1 = TaintTag::Clean; t1.set_stream(1);
+        e.shadow.set_reg_tag(0, t0);
+        e.shadow.set_reg_tag(1, t1);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        let block = lifter_block(p, 0x100, 0x104, BlockExit::Call {
+            target: Value::Const(0x1234_5678, 4),
+            fallthrough: 0x104,
+        });
+        let mut env = MockEnv::new();
+        e.run_group(&[block], 0, &mut env);
+
+        for r in 0..4i16 {
+            assert!(e.shadow.reg_tag(r).is_clean(), "r{r} must be killed for unknown call");
+        }
+    }
+
+    #[test]
+    fn strlen_summary_propagates_string_buffer_taint_to_r0() {
+        let mut e = engine();
+        e.summaries.insert(0xDEAD_0001, FuncSummary::Strlen);
+
+        let mut buf_tag = TaintTag::Clean;
+        buf_tag.set_stream(2);
+        e.shadow.set_mem_tag_range(0x2000_2000, 4, buf_tag);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        let block = lifter_block(p, 0x100, 0x104, BlockExit::Call {
+            target: Value::Const(0xDEAD_0001, 4),
+            fallthrough: 0x104,
+        });
+
+        let mut env = MockEnv::new();
+        env.regs.insert(0, 0x2000_2000u64);
+
+        e.run_group(&[block], 0, &mut env);
+
+        let r0_tag = e.shadow.reg_tag(0);
+        assert!(!r0_tag.is_clean(), "strlen summary must propagate string buffer taint to r0");
+        for r in 1..4i16 {
+            assert!(e.shadow.reg_tag(r).is_clean(), "r{r} must be killed after strlen call");
+        }
+    }
+
+    #[test]
+    fn strlen_summary_stops_at_nul_byte() {
+        let mut e = engine();
+        e.summaries.insert(0xDEAD_0001, FuncSummary::Strlen);
+
+        let mut t0 = TaintTag::Clean; t0.set_stream(0);
+        let mut t_past = TaintTag::Clean; t_past.set_stream(7);
+        e.shadow.mem.insert(0x2000_3000u32, t0);
+        e.shadow.mem.insert(0x2000_3002u32, t_past);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        let block = lifter_block(p, 0x100, 0x104, BlockExit::Call {
+            target: Value::Const(0xDEAD_0001, 4),
+            fallthrough: 0x104,
+        });
+
+        let mut env = MockEnv::new();
+        env.regs.insert(0, 0x2000_3000u64);
+        env.mem.insert(0x2000_3000, 0x41);
+        env.mem.insert(0x2000_3001, 0x00);
+
+        e.run_group(&[block], 0, &mut env);
+
+        let r0_tag = e.shadow.reg_tag(0);
+        let streams: Vec<usize> = r0_tag.iter_streams().collect();
+        assert!(streams.contains(&0), "byte before NUL must contribute its taint");
+        assert!(!streams.contains(&7), "bytes past NUL must not contribute taint");
+    }
+
+    #[test]
+    fn passthrough_summary_preserves_r0_taint() {
+        let mut e = engine();
+        e.summaries.insert(0xDEAD_0002, FuncSummary::Passthrough);
+
+        let mut t = TaintTag::Clean; t.set_stream(5);
+        e.shadow.set_reg_tag(0, t);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        let block = lifter_block(p, 0x100, 0x104, BlockExit::Call {
+            target: Value::Const(0xDEAD_0002, 4),
+            fallthrough: 0x104,
+        });
+
+        let mut env = MockEnv::new();
+        env.regs.insert(0, 0x1234u64);
+
+        e.run_group(&[block], 0, &mut env);
+
+        let r0_tag = e.shadow.reg_tag(0);
+        assert!(!r0_tag.is_clean(), "passthrough summary must preserve r0 taint tag");
+        let streams: Vec<usize> = r0_tag.iter_streams().collect();
+        assert!(streams.contains(&5), "original stream 5 taint must survive passthrough");
+        for r in 1..4i16 {
+            assert!(e.shadow.reg_tag(r).is_clean(), "r{r} must be killed by passthrough call");
+        }
+    }
+
+    #[test]
+    fn memcpy_summary_propagates_shadow_memory() {
+        let mut e = engine();
+        e.summaries.insert(0xDEAD_0000, FuncSummary::Memcpy);
+
+        let mut src_tag = TaintTag::Clean;
+        src_tag.set_stream(3);
+        e.shadow.set_mem_tag_range(0x2000_1000, 4, src_tag);
+
+        let mut p = pcode::Block::new();
+        p.push(marker(0x100));
+        let block = lifter_block(p, 0x100, 0x104, BlockExit::Call {
+            target: Value::Const(0xDEAD_0000, 4),
+            fallthrough: 0x104,
+        });
+
+        let mut env = MockEnv::new();
+        env.regs.insert(0, 0x2000_0000u64);
+        env.regs.insert(1, 0x2000_1000u64);
+        env.regs.insert(2, 4u64);
+
+        e.run_group(&[block], 0, &mut env);
+
+        let dst_tag = e.shadow.mem_tag_range(0x2000_0000, 4);
+        assert!(!dst_tag.is_clean(), "memcpy summary must propagate taint from src to dst buffer");
+        for r in 0..4i16 {
+            assert!(e.shadow.reg_tag(r).is_clean(), "r{r} must be killed after memcpy call");
+        }
     }
 }

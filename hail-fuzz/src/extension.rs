@@ -318,18 +318,13 @@ impl FuzzerStage for MultiStreamExtendStage {
                         fuzzer.get_extension_factor(addr)
                     });
 
-                    // Phase A: structural MMIO dependency inference for the new stream.
-                    // Run at the moment of first detection — no re-execution needed.
-                    if new_mmio_addr {
-                        let readwatch_pc = fuzzer.vm.cpu.read_pc();
+                    // Phase A: structural MMIO dependency inference, keyed by the full
+                    // access context `(addr, readwatch_pc)` across the whole campaign.
+                    let readwatch_pc = fuzzer.vm.cpu.read_pc();
+                    let lifted_blocks = fuzzer.vm.code.blocks.len();
+                    let trigger = fuzzer.mmio_flow.trigger(addr, readwatch_pc, lifted_blocks);
+                    if trigger.run_slice {
                         let target_ctx = AccessContext::new(readwatch_pc, addr);
-                        // Pull in *every* MMIO read site (pc → stream key) observed during this
-                        // execution from the MMIO handler — not just streams that exhausted into a
-                        // ReadWatch.  This lets the backward slice recognise register-indirect MMIO
-                        // loads of any prior stream (including streams that never exhausted) as the
-                        // sources that govern this newly detected stream.  Collected into a temp so
-                        // the handler borrow (of `self.vm`) is released before touching
-                        // `fuzzer.mmio_flow`.
                         let sites: Vec<(u64, StreamKey)> = fuzzer
                             .target
                             .get_mmio_handler(&mut fuzzer.vm)
@@ -343,15 +338,12 @@ impl FuzzerStage for MultiStreamExtendStage {
                             .candidates_for_new_stream(readwatch_pc, &fuzzer.vm.code);
                         if !candidates.is_empty() {
                             tracing::debug!(
-                                "Phase A: new MMIO {addr:#x} at PC {readwatch_pc:#x} — \
-                                 {} structural candidate(s): {:?}",
-                                candidates.len(), candidates
+                                "Phase A: MMIO {addr:#x} at PC {readwatch_pc:#x} \
+                                 (first_seen={}) — {} structural candidate(s): {:?}",
+                                trigger.first_seen, candidates.len(), candidates
                             );
                             fuzzer.relation_graph.add_structural_candidates(target_ctx, &candidates);
 
-                            // Dump the live relation graph for offline evaluation.  When Phase B
-                            // is sampled this iteration, it is re-dumped after the pass below so
-                            // the file reflects the taint-confirmed/classified edges too.
                             if std::env::var_os("DUMP_RELATIONS").is_some() {
                                 let _ = std::fs::write(
                                     fuzzer.workdir.join("relations.json"),
@@ -359,21 +351,18 @@ impl FuzzerStage for MultiStreamExtendStage {
                                 );
                             }
                         }
+                    }
 
-                        // Phase B: decide whether to run a (seed-re-executing) dynamic taint pass.
-                        // Only when `PHASE_B` is set, and sampled (default ≈5%, 1-in-20 new-stream
-                        // events; override with PHASE_B_RATE).  The pass itself runs at the END of
-                        // this loop iteration so it cannot corrupt `fuzzer.state` mid-iteration.
-                        if fuzzer.phase_b.is_some() {
-                            let rate: u64 = std::env::var("PHASE_B_RATE")
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .filter(|&r| r > 0)
-                                .unwrap_or(20);
-                            fuzzer.phase_b_counter += 1;
-                            if fuzzer.phase_b_counter % rate == 0 {
-                                do_phase_b = true;
-                            }
+                    // Phase B: sample whether to run a dynamic taint pass.
+                    if (trigger.first_seen || new_mmio_addr) && fuzzer.phase_b.is_some() {
+                        let rate: u64 = std::env::var("PHASE_B_RATE")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .filter(|&r| r > 0)
+                            .unwrap_or(20);
+                        fuzzer.phase_b_counter += 1;
+                        if fuzzer.phase_b_counter % rate == 0 {
+                            do_phase_b = true;
                         }
                     }
                 };

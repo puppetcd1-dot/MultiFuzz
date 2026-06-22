@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use hashbrown::HashMap;
 
 use crate::stream_relation::AccessContext;
@@ -20,7 +22,7 @@ pub enum TaintTag {
     #[default]
     Clean,
     Inline(u64),
-    Chunked(Box<Vec<u64>>),
+    Chunked(Arc<Vec<u64>>),
 }
 
 /// Bit 62 of an Inline tag: indicates overflow beyond the inline capacity.
@@ -42,7 +44,7 @@ impl TaintTag {
                 } else {
                     let mut chunks = vec![0u64; (stream_index / 64) + 1];
                     chunks[stream_index / 64] |= 1u64 << (stream_index % 64);
-                    *self = TaintTag::Chunked(Box::new(chunks));
+                    *self = TaintTag::Chunked(Arc::new(chunks));
                 }
             }
             TaintTag::Inline(bits) => {
@@ -56,15 +58,16 @@ impl TaintTag {
                     // Preserve old inline bits in chunk 0.
                     chunks[0] = old_bits;
                     chunks[stream_index / 64] |= 1u64 << (stream_index % 64);
-                    *self = TaintTag::Chunked(Box::new(chunks));
+                    *self = TaintTag::Chunked(Arc::new(chunks));
                 }
             }
             TaintTag::Chunked(chunks) => {
                 let needed = (stream_index / 64) + 1;
-                if chunks.len() < needed {
-                    chunks.resize(needed, 0);
+                let v = Arc::make_mut(chunks);
+                if v.len() < needed {
+                    v.resize(needed, 0);
                 }
-                chunks[stream_index / 64] |= 1u64 << (stream_index % 64);
+                v[stream_index / 64] |= 1u64 << (stream_index % 64);
             }
         }
     }
@@ -79,15 +82,15 @@ impl TaintTag {
                 let mut v = vec![0u64; len];
                 for (i, x) in a.iter().enumerate() { v[i] |= x; }
                 for (i, x) in b.iter().enumerate() { v[i] |= x; }
-                TaintTag::Chunked(Box::new(v))
+                TaintTag::Chunked(Arc::new(v))
             }
             (TaintTag::Inline(a), TaintTag::Chunked(b))
             | (TaintTag::Chunked(b), TaintTag::Inline(a)) => {
-                let mut chunks = b.as_ref().clone();
+                let mut chunks: Vec<u64> = b.as_ref().clone();
                 if chunks.is_empty() { chunks.push(0); }
                 // Inline bits go into chunk 0 (inline is ≤62 bits, all in chunk 0).
                 chunks[0] |= a & !OVERFLOW_BIT;
-                TaintTag::Chunked(Box::new(chunks))
+                TaintTag::Chunked(Arc::new(chunks))
             }
         }
     }
@@ -101,7 +104,8 @@ impl TaintTag {
                 // Seed `bits` with chunk 0; the iterator advances to later chunks as each is
                 // exhausted.  (Seeding with 0 here would make the first `next()` skip chunk 0
                 // entirely, dropping streams 0–63.)
-                TagIter::Chunked { chunks, chunk: 0, bits: chunks.first().copied().unwrap_or(0) }
+                let v: &Vec<u64> = chunks.as_ref();
+                TagIter::Chunked { chunks: v, chunk: 0, bits: v.first().copied().unwrap_or(0) }
             }
         }
     }
