@@ -552,7 +552,7 @@ pub(crate) struct Fuzzer {
     pub features: config::EnabledFeatures,
     /// Controls which debugging features should be enabled.
     pub debug: config::DebugSettings,
-    /// Directed graph of structural and taint-confirmed dependencies between MMIO streams.
+    /// Directed graph of taint-confirmed dependencies between MMIO streams.
     pub relation_graph: StreamRelationGraph,
     /// Phase A: structural MMIO dependency analyzer (P-code backward demand slice).
     pub mmio_flow: MmioFlowAnalyzer,
@@ -570,6 +570,12 @@ pub(crate) struct Fuzzer {
     /// The number of lifted blocks at the last frontier recompute, used to throttle the
     /// (relatively expensive) frontier attribution to coverage-growth events.
     pub frontier_block_count: usize,
+    /// Per-stream stagnation counters: how many mutations since last new coverage from
+    /// this stream.  Used to penalise over-mutated streams in frontier weighting.
+    pub stagnation: HashMap<StreamKey, u32>,
+    /// Current frontier branch block addresses — conditional blocks with at least one
+    /// uncovered successor.  Updated alongside frontier weights.
+    pub frontier_branches: HashSet<u64>,
 }
 
 impl Fuzzer {
@@ -736,6 +742,8 @@ impl Fuzzer {
             phase_b_counter: 0,
             frontier_weights: HashMap::new(),
             frontier_block_count: 0,
+            stagnation: HashMap::new(),
+            frontier_branches: HashSet::new(),
         })
     }
 
@@ -763,10 +771,16 @@ impl Fuzzer {
         }
         self.frontier_block_count = lifted;
 
-        let weights = mmio_flow::compute_frontier_stream_weights(&self.vm.code, &self.mmio_flow);
+        let weights = mmio_flow::compute_frontier_stream_weights(
+            &self.vm.code,
+            &self.mmio_flow,
+            &self.stagnation,
+        );
+        self.frontier_branches = mmio_flow::compute_frontier_branch_set(&self.vm.code);
         tracing::debug!(
-            "frontier weights recomputed from {lifted} lifted blocks: {} gating stream(s)",
-            weights.len()
+            "frontier weights recomputed from {lifted} lifted blocks: {} gating stream(s), {} frontier branches",
+            weights.len(),
+            self.frontier_branches.len(),
         );
         self.frontier_weights = weights;
     }
@@ -818,23 +832,26 @@ impl Fuzzer {
             st.finish_pass()
         };
 
-        let before = self.relation_graph.edge_count();
-        // Age unconfirmed structural candidates by one pass *before* merging this
-        // pass's confirmations: an edge confirmed here has its decay reset to 0, so
-        // only candidates that went another full pass without confirmation age.
-        self.relation_graph.age_structural_edges();
         phase_b::apply_pass_result(
             &mut self.relation_graph,
             &mut self.length_store,
             result,
         );
         tracing::debug!(
-            "Phase B pass complete: {} edges in graph ({} confirmed, {} structural expired)",
+            "Phase B pass complete: {} edges in graph",
             self.relation_graph.edge_count(),
-            self.relation_graph.confirmed_edges().count(),
-            self.relation_graph.expired_structural_count(),
         );
-        let _ = before;
+    }
+
+    /// Check if the last execution hit any frontier branch block (used for hybrid
+    /// Phase B trigger).  Returns true if the exit PC or known covered blocks
+    /// intersect with the frontier branch set.
+    pub fn check_frontier_hit(&self) -> bool {
+        if self.frontier_branches.is_empty() {
+            return false;
+        }
+        let exit_pc = self.vm.cpu.read_pc();
+        self.frontier_branches.contains(&exit_pc)
     }
 
     /// Runs the VM until it exits or executs `limit` number of instructions and update the current
@@ -1030,6 +1047,15 @@ impl Fuzzer {
             if self.state.new_coverage {
                 metadata.finds += 1;
                 metadata.last_find = metadata.execs;
+                // New coverage resets stagnation for all streams in this input.
+                for &key in self.state.input.streams.keys() {
+                    self.stagnation.insert(key, 0);
+                }
+            } else {
+                // No new coverage: increment stagnation for streams that were mutated.
+                if let Some(last_read) = self.state.input.last_read {
+                    *self.stagnation.entry(last_read).or_insert(0) += 1;
+                }
             }
         }
     }

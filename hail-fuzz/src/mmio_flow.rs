@@ -474,32 +474,83 @@ fn target_addr(target: &Target, code: &BlockTable) -> Option<u64> {
     }
 }
 
-/// Compute per-stream mutation weight boosts from frontier branches (uncovered successors).
-/// Streams gating more frontier branches get a larger saturating boost toward `1+FRONTIER_BOOST`.
-pub fn compute_frontier_stream_weights(
-    code: &BlockTable,
-    mmio_flow: &MmioFlowAnalyzer,
-) -> HashMap<StreamKey, f64> {
+/// Return the set of frontier branch block start addresses: blocks with a conditional exit
+/// where at least one successor has not been lifted (i.e. its start address is not in `reached`).
+/// Used by the hybrid trigger in main.rs.
+pub fn compute_frontier_branch_set(code: &BlockTable) -> HashSet<u64> {
     let reached: HashSet<u64> = code.blocks.iter().map(|b| b.start).collect();
-    let reverse_cfg = build_reverse_cfg(code);
-
-    let mut counts: HashMap<StreamKey, u32> = HashMap::new();
-    let mut processed = 0usize;
+    let mut frontier = HashSet::new();
     for block in &code.blocks {
-        if processed >= MAX_FRONTIER_BRANCHES { break; }
         if block.exit.cond().is_none() { continue; }
         let is_frontier = block.exit.targets().any(|t| {
             target_addr(&t, code).map_or(false, |addr| !reached.contains(&addr))
         });
-        if !is_frontier { continue; }
-        processed += 1;
-        for key in mmio_flow.candidates_for_branch_with_cfg(block.start, code, &reverse_cfg) {
-            *counts.entry(key).or_insert(0) += 1;
+        if is_frontier {
+            frontier.insert(block.start);
+        }
+    }
+    frontier
+}
+
+/// Compute per-stream mutation weight boosts from frontier branches.
+///
+/// For each frontier branch (conditional exit with at least one uncovered successor):
+///   - `unlock_potential`: number of uncovered successor addresses (typically 1 or 2).
+///   - `rarity`: `1.0 / (predecessor_count + 1)` where `predecessor_count` is the number of
+///     blocks in the reverse CFG that list this branch block as a successor. Falls back to
+///     `1.0 / 2.0` when unknown.
+///
+/// Each gating MMIO stream accumulates `unlock_potential * rarity` across all frontier branches
+/// it controls.  A stagnation penalty `1.0 / (1 + stagnation_count)` is then applied per stream.
+/// The final weight is capped at `1.0 + FRONTIER_BOOST`.
+pub fn compute_frontier_stream_weights(
+    code: &BlockTable,
+    mmio_flow: &MmioFlowAnalyzer,
+    stagnation: &HashMap<StreamKey, u32>,
+) -> HashMap<StreamKey, f64> {
+    let reached: HashSet<u64> = code.blocks.iter().map(|b| b.start).collect();
+    let reverse_cfg = build_reverse_cfg(code);
+
+    // Count how many times each block appears as a predecessor target (for rarity).
+    let mut pred_count: HashMap<u64, u32> = HashMap::new();
+    for preds in reverse_cfg.values() {
+        for &(pred_start, _) in preds {
+            *pred_count.entry(pred_start).or_insert(0) += 1;
         }
     }
 
-    counts.into_iter()
-        .map(|(k, n)| (k, 1.0 + FRONTIER_BOOST * (1.0 - 1.0 / (1.0 + n as f64))))
+    let mut accum: HashMap<StreamKey, f64> = HashMap::new();
+    let mut processed = 0usize;
+    for block in &code.blocks {
+        if processed >= MAX_FRONTIER_BRANCHES { break; }
+        if block.exit.cond().is_none() { continue; }
+
+        // Count uncovered successors (unlock_potential).
+        let unlock_potential: u32 = block.exit.targets()
+            .filter(|t| target_addr(t, code).map_or(false, |addr| !reached.contains(&addr)))
+            .count() as u32;
+        if unlock_potential == 0 { continue; }
+
+        processed += 1;
+
+        // Rarity: inverse of how many predecessors reference this block.
+        let hit_count = pred_count.get(&block.start).copied().unwrap_or(1);
+        let rarity = 1.0 / (hit_count as f64 + 1.0);
+
+        let contribution = unlock_potential as f64 * rarity;
+
+        for key in mmio_flow.candidates_for_branch_with_cfg(block.start, code, &reverse_cfg) {
+            *accum.entry(key).or_insert(0.0) += contribution;
+        }
+    }
+
+    let cap = 1.0 + FRONTIER_BOOST;
+    accum.into_iter()
+        .map(|(k, raw)| {
+            let stag = stagnation.get(&k).copied().unwrap_or(0);
+            let penalized = raw * 1.0 / (1 + stag) as f64;
+            (k, (1.0 + penalized).min(cap))
+        })
         .collect()
 }
 
@@ -972,7 +1023,7 @@ mod tests {
         let mut analyzer = MmioFlowAnalyzer::new(vec![]);
         analyzer.record_read_site(0x700, stream);
 
-        let weights = compute_frontier_stream_weights(&code, &analyzer);
+        let weights = compute_frontier_stream_weights(&code, &analyzer, &HashMap::new());
         assert!(
             weights.get(&stream).copied().unwrap_or(1.0) > 1.0,
             "stream gating an uncovered branch target must be boosted; got {weights:?}"
@@ -993,10 +1044,97 @@ mod tests {
         fall2.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
 
         let code_covered = block_table(vec![branch2, fall2, dead_block]);
-        let weights_covered = compute_frontier_stream_weights(&code_covered, &analyzer);
+        let weights_covered = compute_frontier_stream_weights(&code_covered, &analyzer, &HashMap::new());
         assert!(
             weights_covered.get(&stream).is_none(),
             "no boost once every branch target is covered; got {weights_covered:?}"
+        );
+    }
+
+    /// `compute_frontier_branch_set` returns the start addresses of conditional blocks
+    /// with at least one uncovered successor.
+    #[test]
+    fn frontier_branch_set_contains_uncovered_targets() {
+        let branch = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+        let mut fall_pcode = pcode::Block::new();
+        fall_pcode.push(marker(0x720));
+        fall_pcode.push((VarNode::new(2, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut fall = lifter_block(fall_pcode, 0x720, 0x724);
+        fall.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+
+        let code = block_table(vec![branch, fall]);
+        let frontier = compute_frontier_branch_set(&code);
+
+        assert!(
+            frontier.contains(&0x700),
+            "branch @0x700 with uncovered target 0xDEAD must be in frontier set; got {frontier:?}"
+        );
+
+        // Once all successors are covered, the branch is no longer frontier.
+        let branch2 = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+        let mut fall2_pcode = pcode::Block::new();
+        fall2_pcode.push(marker(0x720));
+        fall2_pcode.push((VarNode::new(2, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut fall2 = lifter_block(fall2_pcode, 0x720, 0x724);
+        fall2.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+
+        let mut deads = pcode::Block::new();
+        deads.push(marker(0xDEAD));
+        deads.push((VarNode::new(3, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut dead_block = lifter_block(deads, 0xDEAD, 0xDEB1);
+        dead_block.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+
+        let code_covered = block_table(vec![branch2, fall2, dead_block]);
+        let frontier_covered = compute_frontier_branch_set(&code_covered);
+        assert!(
+            !frontier_covered.contains(&0x700),
+            "branch @0x700 with all successors covered must NOT be in frontier set; got {frontier_covered:?}"
+        );
+    }
+
+    /// Stagnation penalty reduces stream weight: a stream with high stagnation count
+    /// receives a smaller boost than the same stream with zero stagnation.
+    #[test]
+    fn stagnation_penalty_reduces_weight() {
+        let stream = 0x5800_0010u64;
+
+        let branch = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+        let mut fall_pcode = pcode::Block::new();
+        fall_pcode.push(marker(0x720));
+        fall_pcode.push((VarNode::new(2, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut fall = lifter_block(fall_pcode, 0x720, 0x724);
+        fall.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+
+        let code = block_table(vec![branch, fall]);
+        let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+        analyzer.record_read_site(0x700, stream);
+
+        // No stagnation: full weight.
+        let w_none = compute_frontier_stream_weights(&code, &analyzer, &HashMap::new());
+        let weight_fresh = w_none.get(&stream).copied().unwrap_or(1.0);
+
+        // High stagnation: reduced weight.
+        let mut stag = HashMap::new();
+        stag.insert(stream, 10u32);
+        // Need fresh blocks because block_table consumed the originals.
+        let branch2 = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+        let mut fall2_pcode = pcode::Block::new();
+        fall2_pcode.push(marker(0x720));
+        fall2_pcode.push((VarNode::new(2, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+        let mut fall2 = lifter_block(fall2_pcode, 0x720, 0x724);
+        fall2.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+        let code2 = block_table(vec![branch2, fall2]);
+
+        let w_stag = compute_frontier_stream_weights(&code2, &analyzer, &stag);
+        let weight_stagnant = w_stag.get(&stream).copied().unwrap_or(1.0);
+
+        assert!(
+            weight_stagnant < weight_fresh,
+            "stagnation penalty must reduce weight: fresh={weight_fresh}, stagnant={weight_stagnant}"
+        );
+        assert!(
+            weight_stagnant >= 1.0,
+            "stagnated weight must still be >= 1.0; got {weight_stagnant}"
         );
     }
 

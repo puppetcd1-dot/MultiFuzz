@@ -2,9 +2,6 @@ use hashbrown::HashMap;
 
 use crate::input::StreamKey;
 
-/// Unconfirmed structural edges soft-expire after this many Phase B passes.
-const STRUCTURAL_EXPIRY: u32 = 8;
-
 // ──────────────────────────────────────────────────────────────────────────────
 // AccessContext
 // ──────────────────────────────────────────────────────────────────────────────
@@ -34,7 +31,7 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
-    /// Specificity ranking: Address > Length > Control.  Confirmed edges never downgrade.
+    /// Specificity ranking: Address > Length > Control.  Edges never downgrade.
     pub fn priority(self) -> u8 {
         match self {
             EdgeKind::Address => 3,
@@ -42,14 +39,6 @@ impl EdgeKind {
             EdgeKind::Control => 1,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Confidence {
-    /// Edge inferred structurally from P-code IR (Phase A).
-    Structural,
-    /// Edge confirmed by dynamic taint analysis (Phase B).
-    TaintConfirmed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,13 +134,10 @@ pub struct StreamEdge {
     pub source:     AccessContext,
     pub target:     AccessContext,
     pub kind:       EdgeKind,
-    pub confidence: Confidence,
     /// For confirmed Length edges: maps val_A → expected count_B.
     pub relation:   Option<Relation>,
     /// For Control edges: `(value, hit_count)` discriminants, capped at MAX_DISCRIMINANTS.
     pub value_set:  Vec<(u64, u32)>,
-    /// Phase B passes survived as Structural; past STRUCTURAL_EXPIRY the edge soft-expires.
-    pub decay:      u32,
 }
 
 #[derive(Default)]
@@ -170,65 +156,54 @@ impl StreamRelationGraph {
     pub fn set_assist_enabled(&mut self, enabled: bool) { self.assist_enabled = enabled; }
     pub fn assist_enabled(&self) -> bool { self.assist_enabled }
 
-    pub fn add_structural_candidates(
-        &mut self,
-        target: AccessContext,
-        sources: &[(AccessContext, EdgeKind)],
-    ) {
-        for &(source, kind) in sources {
-            if source.addr == target.addr || self.has_edge(source, target) {
-                continue;
-            }
-            let idx = self.edges.len();
-            self.edges.push(StreamEdge {
-                source,
-                target,
-                kind,
-                confidence: Confidence::Structural,
-                relation: None,
-                value_set: Vec::new(),
-                decay: 0,
-            });
-            self.outgoing.entry(source.addr).or_default().push(idx);
-            self.incoming.entry(target.addr).or_default().push(idx);
-        }
-    }
-
-    /// Upgrade-only: confirm or reclassify a structural candidate.
-    /// Observations with no structural backing are dropped (taint over-approximation).
-    /// Returns `true` if at least one candidate was upgraded.
-    pub fn confirm_edge(
+    /// Insert a new taint-confirmed edge, or upgrade an existing one.
+    ///
+    /// - If an edge with the same `(source, target)` exists: upgrade kind if higher
+    ///   priority (Address > Length > Control), merge relation (keep existing if new
+    ///   is None; update if new is Some), don't downgrade kind.
+    /// - If no exact match but same `(source.addr, target.addr)` pair exists: same
+    ///   upgrade logic.
+    /// - If no edge exists at all: create a new edge and index it.
+    pub fn insert_or_confirm_edge(
         &mut self,
         source: AccessContext,
         target: AccessContext,
         kind: EdgeKind,
         relation: Option<Relation>,
-    ) -> bool {
-        let Some(indices) = self.incoming.get(&target.addr).cloned() else {
-            return false;
-        };
-        // Prefer exact context match; fall back to address-pair match.
-        for &idx in &indices {
-            let edge = &mut self.edges[idx];
-            if edge.source == source && edge.target == target {
-                Self::apply_confirmation(edge, kind, relation);
-                return true;
+    ) {
+        // Try exact context match first.
+        if let Some(indices) = self.incoming.get(&target.addr).cloned() {
+            for &idx in &indices {
+                let edge = &self.edges[idx];
+                if edge.source == source && edge.target == target {
+                    Self::upgrade_edge(&mut self.edges[idx], kind, relation);
+                    return;
+                }
+            }
+            // Fall back to address-pair match.
+            for &idx in &indices {
+                let edge = &self.edges[idx];
+                if edge.source.addr == source.addr {
+                    Self::upgrade_edge(&mut self.edges[idx], kind, relation);
+                    return;
+                }
             }
         }
-        let mut upgraded = false;
-        for &idx in &indices {
-            let edge = &mut self.edges[idx];
-            if edge.source.addr == source.addr {
-                Self::apply_confirmation(edge, kind, relation.clone());
-                upgraded = true;
-            }
-        }
-        upgraded
+        // No existing edge — create a new one.
+        let idx = self.edges.len();
+        self.edges.push(StreamEdge {
+            source,
+            target,
+            kind,
+            relation,
+            value_set: Vec::new(),
+        });
+        self.outgoing.entry(source.addr).or_default().push(idx);
+        self.incoming.entry(target.addr).or_default().push(idx);
     }
 
-    fn apply_confirmation(edge: &mut StreamEdge, kind: EdgeKind, relation: Option<Relation>) {
-        edge.confidence = Confidence::TaintConfirmed;
-        edge.decay = 0;
+    /// Upgrade an existing edge: never downgrade kind, merge relation.
+    fn upgrade_edge(edge: &mut StreamEdge, kind: EdgeKind, relation: Option<Relation>) {
         // Never downgrade: Address > Length > Control.
         if kind.priority() >= edge.kind.priority() {
             edge.kind = kind;
@@ -238,7 +213,7 @@ impl StreamRelationGraph {
         }
     }
 
-    /// Record a discriminant value on confirmed Control edges. Frequency-based eviction:
+    /// Record a discriminant value on Control edges. Frequency-based eviction:
     /// singletons are displaced before multi-hit entries; discards new values when all slots are multi-hit.
     pub fn record_discriminant(&mut self, source: StreamKey, target: StreamKey, value: u64) {
         const MAX_DISCRIMINANTS: usize = 16;
@@ -262,7 +237,7 @@ impl StreamRelationGraph {
         }
     }
 
-    /// Propagate fitted relations to all TaintConfirmed Length edges sharing the same
+    /// Propagate fitted relations to all Length edges sharing the same
     /// address pair (sibling edges from earlier passes may lack a relation otherwise).
     pub fn backfill_length_relations(
         &mut self,
@@ -271,7 +246,6 @@ impl StreamRelationGraph {
         for ((src_addr, tgt_addr), relation) in relations {
             for edge in &mut self.edges {
                 if edge.kind == EdgeKind::Length
-                    && edge.confidence == Confidence::TaintConfirmed
                     && edge.source.addr == src_addr
                     && edge.target.addr == tgt_addr
                     && edge.relation.is_none()
@@ -280,21 +254,6 @@ impl StreamRelationGraph {
                 }
             }
         }
-    }
-
-    pub fn age_structural_edges(&mut self) {
-        for edge in &mut self.edges {
-            if edge.confidence == Confidence::Structural && edge.decay < u32::MAX {
-                edge.decay += 1;
-            }
-        }
-    }
-
-    pub fn expired_structural_count(&self) -> usize {
-        self.edges
-            .iter()
-            .filter(|e| e.confidence == Confidence::Structural && e.decay >= STRUCTURAL_EXPIRY)
-            .count()
     }
 
     pub fn has_edge(&self, source: AccessContext, target: AccessContext) -> bool {
@@ -308,40 +267,48 @@ impl StreamRelationGraph {
         indices.iter().map(|&i| &self.edges[i])
     }
 
+    /// Returns deduplicated `(source_addr, kind)` pairs for all edges targeting
+    /// `target_addr`.  When multiple edges share the same `source_addr`, returns
+    /// the highest priority kind (Address > Length > Control).
+    pub fn get_governors_by_addr(&self, target_addr: StreamKey) -> Vec<(StreamKey, EdgeKind)> {
+        let mut best: HashMap<StreamKey, EdgeKind> = HashMap::new();
+        let indices = self.incoming.get(&target_addr).map(|v| v.as_slice()).unwrap_or(&[]);
+        for &idx in indices {
+            let edge = &self.edges[idx];
+            let entry = best.entry(edge.source.addr).or_insert(edge.kind);
+            if edge.kind.priority() > entry.priority() {
+                *entry = edge.kind;
+            }
+        }
+        best.into_iter().collect()
+    }
+
     pub fn dependents(&self, source: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.outgoing.get(&source).map(|v| v.as_slice()).unwrap_or(&[]);
         indices.iter().map(|&i| &self.edges[i])
     }
 
     pub fn confirmed_edges(&self) -> impl Iterator<Item = &StreamEdge> {
-        self.edges.iter().filter(|e| e.confidence == Confidence::TaintConfirmed)
+        self.edges.iter()
     }
 
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
 
-    /// Mutation weight multiplier (≥1.0) for a stream participating in dependencies.
+    /// Mutation weight multiplier (>=1.0) for a stream participating in dependencies.
     pub fn mutation_weight_factor(&self, addr: StreamKey) -> f64 {
         if !self.assist_enabled { return 1.0; }
         let mut factor = 1.0_f64;
         for list in [self.incoming.get(&addr), self.outgoing.get(&addr)].into_iter().flatten() {
             for &idx in list {
                 let edge = &self.edges[idx];
-                if edge.confidence == Confidence::Structural && edge.decay >= STRUCTURAL_EXPIRY { continue; }
                 let base = match edge.kind { EdgeKind::Address | EdgeKind::Length => 4.0, EdgeKind::Control => 2.0 };
-                let bonus = match edge.confidence { Confidence::TaintConfirmed => 1.5, Confidence::Structural => 1.0 };
+                let bonus = 1.5;
                 factor = factor.max(base * bonus);
             }
         }
         factor
-    }
-
-    #[cfg(test)]
-    fn confidence_of(&self, source: StreamKey, target: StreamKey) -> Option<Confidence> {
-        self.incoming.get(&target).and_then(|v| {
-            v.iter().map(|&i| &self.edges[i]).find(|e| e.source.addr == source).map(|e| e.confidence)
-        })
     }
 
     pub fn to_json(&self) -> String {
@@ -362,10 +329,10 @@ impl StreamRelationGraph {
             s.push_str(&format!(
                 "  {{\"source_pc\":\"{:#x}\",\"source_addr\":\"{:#x}\",\
                  \"target_pc\":\"{:#x}\",\"target_addr\":\"{:#x}\",\
-                 \"kind\":\"{:?}\",\"confidence\":\"{:?}\",\"relation\":\"{}\",\
-                 \"decay\":{},\"values\":[{}]}}",
+                 \"kind\":\"{:?}\",\"confidence\":\"TaintConfirmed\",\"relation\":\"{}\",\
+                 \"values\":[{}]}}",
                 e.source.pc, e.source.addr, e.target.pc, e.target.addr,
-                e.kind, e.confidence, relation, e.decay, values
+                e.kind, relation, values
             ));
         }
         s.push_str("\n]\n");
@@ -437,8 +404,8 @@ mod tests {
         assert!(matches!(rel.kind, RelKind::Linear { k: -1, c: 4 }));
     }
 
-    /// Fix 2: Reclassifying an edge to a *more specific* kind clears stale fields
-    /// from the previous kind (Control→Length drops the discriminant value_set).
+    /// Reclassifying an edge to a *more specific* kind clears stale fields
+    /// from the previous kind (Control->Length drops the discriminant value_set).
     #[test]
     fn reclassification_clears_stale_relation_and_value_set() {
         let mut g = StreamRelationGraph::new();
@@ -446,152 +413,61 @@ mod tests {
         let b = ctx(0x20, 0x5800_0004);
 
         // Start as Control; add a discriminant.
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
-        g.confirm_edge(a, b, EdgeKind::Control, None);
+        g.insert_or_confirm_edge(a, b, EdgeKind::Control, None);
         g.record_discriminant(a.addr, b.addr, 0x3);
         assert!(!g.governors(b.addr).next().unwrap().value_set.is_empty());
 
         // Reclassify to Length (priority Length > Control): value_set must be cleared.
-        g.confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
+        g.insert_or_confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
         let edge = g.governors(b.addr).next().unwrap();
         assert_eq!(edge.kind, EdgeKind::Length);
-        assert!(edge.value_set.is_empty(), "reclassify→Length must clear value_set");
+        assert!(edge.value_set.is_empty(), "reclassify->Length must clear value_set");
         assert!(edge.relation.is_some(), "relation should be set after Length confirmation");
     }
 
-    /// Issue #2 fix: a confirmed `Address` edge is never downgraded to `Control`.
-    ///
-    /// A source value that computes B's address (`base + A`) is usually *also*
-    /// checked in a branch, so the same edge receives both an Address and a Control
-    /// confirmation.  Address (precise value flow) must win regardless of order.
+    /// A confirmed `Address` edge is never downgraded to `Control`.
     #[test]
     fn address_confirmation_is_not_downgraded_by_control() {
         let mut g = StreamRelationGraph::new();
         let a = ctx(0x10, 0x5800_0000);
         let b = ctx(0x20, 0x5800_0004);
-        // Phase A may seed it as a Control candidate.
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
 
-        // Phase B confirms the Address channel first (as apply_pass_result does).
-        g.confirm_edge(a, b, EdgeKind::Address, None);
+        // Insert as Address first.
+        g.insert_or_confirm_edge(a, b, EdgeKind::Address, None);
         assert_eq!(g.governors(b.addr).next().unwrap().kind, EdgeKind::Address);
 
         // A later Control confirmation for the same edge must NOT clobber Address.
-        g.confirm_edge(a, b, EdgeKind::Control, None);
+        g.insert_or_confirm_edge(a, b, EdgeKind::Control, None);
         let edge = g.governors(b.addr).next().unwrap();
         assert_eq!(edge.kind, EdgeKind::Address, "Control must not downgrade Address");
-        assert_eq!(edge.confidence, Confidence::TaintConfirmed);
     }
 
     /// A confirmed `Length` (loop) edge is likewise not downgraded by a later
-    /// non-looping Control observation — the fitted relation is preserved.
+    /// non-looping Control observation -- the fitted relation is preserved.
     #[test]
     fn length_confirmation_is_not_downgraded_by_control() {
         let mut g = StreamRelationGraph::new();
         let a = ctx(0x10, 0x5800_0000);
         let b = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
 
-        g.confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
-        g.confirm_edge(a, b, EdgeKind::Control, None);
+        g.insert_or_confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
+        g.insert_or_confirm_edge(a, b, EdgeKind::Control, None);
         let edge = g.governors(b.addr).next().unwrap();
         assert_eq!(edge.kind, EdgeKind::Length, "Control must not downgrade Length");
         assert!(edge.relation.is_some(), "fitted relation must be preserved");
     }
 
-    /// Issue #1 fix: an unconfirmed structural edge soft-expires after
-    /// `STRUCTURAL_EXPIRY` passes — its mutation weight drops back to neutral so a
-    /// Phase A false positive cannot bias exploration forever.
-    #[test]
-    fn structural_edge_soft_expires_after_aging() {
-        let mut g = StreamRelationGraph::new();
-        let a = ctx(0x10, 0x5800_0000);
-        let b = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b, &[(a, EdgeKind::Address)]);
-
-        // Fresh structural Address edge biases mutation (>1.0).
-        assert!(g.mutation_weight_factor(a.addr) > 1.0);
-        assert_eq!(g.expired_structural_count(), 0);
-
-        // Age it past the expiry threshold without ever confirming it.
-        for _ in 0..STRUCTURAL_EXPIRY {
-            g.age_structural_edges();
-        }
-        assert_eq!(g.expired_structural_count(), 1, "edge must be counted as expired");
-        assert_eq!(
-            g.mutation_weight_factor(a.addr),
-            1.0,
-            "expired structural edge must contribute no mutation bias"
-        );
-    }
-
-    /// Confirming an edge resets its aging clock, so a genuine (taint-confirmed)
-    /// edge never expires even after many subsequent passes.
-    #[test]
-    fn confirmation_resets_decay_and_protects_from_expiry() {
-        let mut g = StreamRelationGraph::new();
-        let a = ctx(0x10, 0x5800_0000);
-        let b = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
-
-        // Age it most of the way to expiry, then confirm.
-        for _ in 0..(STRUCTURAL_EXPIRY - 1) {
-            g.age_structural_edges();
-        }
-        g.confirm_edge(a, b, EdgeKind::Control, None);
-
-        // Many more passes must not expire a confirmed edge.
-        for _ in 0..(STRUCTURAL_EXPIRY * 4) {
-            g.age_structural_edges();
-        }
-        assert_eq!(g.expired_structural_count(), 0, "confirmed edge must never expire");
-        assert!(
-            g.mutation_weight_factor(a.addr) > 1.0,
-            "confirmed edge keeps biasing mutation"
-        );
-    }
-
-    /// Phase B must NOT invent edges: an observation with no structural backing is
-    /// dropped, so the confirmed graph can never exceed Phase A's candidate set.
-    #[test]
-    fn confirm_without_structural_backing_is_dropped() {
-        let mut g = StreamRelationGraph::new();
-        let a = ctx(0x10, 0x5800_0000);
-        let b = ctx(0x20, 0x5800_0004);
-
-        let upgraded = g.confirm_edge(a, b, EdgeKind::Control, None);
-        assert!(!upgraded, "unbacked confirmation must report no upgrade");
-        assert_eq!(g.edge_count(), 0, "Phase B must not invent an edge from nothing");
-    }
-
-    /// A structural candidate is upgraded in place (no new row) and reclassified.
-    #[test]
-    fn confirm_upgrades_structural_candidate_in_place() {
-        let mut g = StreamRelationGraph::new();
-        let a = ctx(0x10, 0x5800_0000);
-        let b = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
-        assert_eq!(g.confidence_of(0x5800_0000, 0x5800_0004), Some(Confidence::Structural));
-
-        let upgraded = g.confirm_edge(a, b, EdgeKind::Length, None);
-        assert!(upgraded);
-        assert_eq!(g.edge_count(), 1, "confirmation upgrades in place, never adds a row");
-        assert_eq!(g.confidence_of(0x5800_0000, 0x5800_0004), Some(Confidence::TaintConfirmed));
-        assert_eq!(g.governors(0x5800_0004).next().unwrap().kind, EdgeKind::Length);
-    }
-
-    /// Fix 4: Discriminating values accumulate with hit counts, dedup increments
+    /// Discriminating values accumulate with hit counts, dedup increments
     /// the existing count, and the set stays bounded at MAX_DISCRIMINANTS.
     #[test]
     fn record_discriminant_accumulates_with_hit_counts() {
         let mut g = StreamRelationGraph::new();
         let a = ctx(0x10, 0x5800_0000);
         let b = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
-        g.confirm_edge(a, b, EdgeKind::Control, None);
+        g.insert_or_confirm_edge(a, b, EdgeKind::Control, None);
 
         g.record_discriminant(a.addr, b.addr, 3);
-        g.record_discriminant(a.addr, b.addr, 3); // duplicate → hit_count=2
+        g.record_discriminant(a.addr, b.addr, 3); // duplicate -> hit_count=2
         g.record_discriminant(a.addr, b.addr, 7);
         let edge = g.governors(b.addr).next().unwrap();
         let vals: Vec<u64> = edge.value_set.iter().map(|&(v, _)| v).collect();
@@ -613,21 +489,20 @@ mod tests {
         assert!(g.governors(b.addr).next().unwrap().value_set.len() <= 16);
     }
 
-    /// Fix 4: Frequency-based eviction — a singleton is evicted when the cap is
+    /// Frequency-based eviction: a singleton is evicted when the cap is
     /// full, but a multi-hit entry survives.
     #[test]
     fn record_discriminant_frequency_eviction_protects_recurring_values() {
         let mut g = StreamRelationGraph::new();
         let a = ctx(0x10, 0x5800_0000);
         let b = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
-        g.confirm_edge(a, b, EdgeKind::Control, None);
+        g.insert_or_confirm_edge(a, b, EdgeKind::Control, None);
 
         // Fill cap with 16 distinct singletons.
         for v in 0u64..16 {
             g.record_discriminant(a.addr, b.addr, v);
         }
-        // Reinforce value 0 → hit_count=2.
+        // Reinforce value 0 -> hit_count=2.
         g.record_discriminant(a.addr, b.addr, 0);
         // Push a 17th value: must evict a singleton (hit_count=1), not value 0.
         g.record_discriminant(a.addr, b.addr, 99);
@@ -649,15 +524,14 @@ mod tests {
         );
     }
 
-    /// Fix 4: When all entries are multi-hit, a new singleton is discarded
+    /// When all entries are multi-hit, a new singleton is discarded
     /// rather than displacing a confirmed recurring value.
     #[test]
     fn record_discriminant_discards_when_all_entries_are_recurring() {
         let mut g = StreamRelationGraph::new();
         let a = ctx(0x10, 0x5800_0000);
         let b = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
-        g.confirm_edge(a, b, EdgeKind::Control, None);
+        g.insert_or_confirm_edge(a, b, EdgeKind::Control, None);
 
         // Fill cap, then make all entries multi-hit.
         for v in 0u64..16 {
@@ -670,45 +544,28 @@ mod tests {
         assert!(!edge.value_set.iter().any(|&(v, _)| v == 999), "singleton discarded when all entries recurring");
     }
 
-    /// A discriminant is only attached to `Control` edges — never `Length`/`Address`.
+    /// A discriminant is only attached to `Control` edges -- never `Length`/`Address`.
     #[test]
     fn record_discriminant_ignores_non_control_edges() {
         let mut g = StreamRelationGraph::new();
         let a = ctx(0x10, 0x5800_0000);
         let b = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
-        g.confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
+        g.insert_or_confirm_edge(a, b, EdgeKind::Length, Some(Relation { kind: RelKind::Identity }));
 
         g.record_discriminant(a.addr, b.addr, 42);
         let edge = g.governors(b.addr).next().unwrap();
         assert!(edge.value_set.is_empty(), "Length edge must not receive discriminants");
     }
 
-    /// PC mismatch between Phase A and Phase B still confirms via the address pair,
-    /// and the confirmed-edge count stays bounded by the structural candidate count.
-    #[test]
-    fn confirm_matches_by_address_pair_when_pc_differs() {
-        let mut g = StreamRelationGraph::new();
-        let a_struct = ctx(0x10, 0x5800_0000);
-        let b_struct = ctx(0x20, 0x5800_0004);
-        g.add_structural_candidates(b_struct, &[(a_struct, EdgeKind::Control)]);
-
-        let a_obs = ctx(0x99, 0x5800_0000);
-        let b_obs = ctx(0xaa, 0x5800_0004);
-        let upgraded = g.confirm_edge(a_obs, b_obs, EdgeKind::Control, None);
-
-        assert!(upgraded);
-        assert_eq!(g.edge_count(), 1, "no duplicate row for the PC-shifted observation");
-        assert_eq!(g.confidence_of(0x5800_0000, 0x5800_0004), Some(Confidence::TaintConfirmed));
-    }
-
-    /// Problem 2 fix: `backfill_length_relations` propagates a fitted relation to all
-    /// confirmed Length edges sharing the same (src_addr, tgt_addr) pair, not just the
-    /// one that happened to trigger the latest `record` call in `apply_pass_result`.
+    /// `backfill_length_relations` propagates a fitted relation to all
+    /// Length edges sharing the same (src_addr, tgt_addr) pair.
     ///
     /// Scenario: two edges for the same address pair (different access PCs) are both
-    /// confirmed as Length, but only edge-1 got the relation from `confirm_edge`.
-    /// After calling `backfill_length_relations`, edge-2 must carry the same relation.
+    /// Length, but only edge-1 has a relation. After calling `backfill_length_relations`,
+    /// edge-2 must carry the same relation.
+    ///
+    /// Since `insert_or_confirm_edge` merges by address pair, we manually push the
+    /// second edge to simulate a sibling created through a different code path.
     #[test]
     fn backfill_length_relations_fills_sibling_edges() {
         let src_addr: StreamKey = 0x4001_0000;
@@ -720,13 +577,23 @@ mod tests {
         let b2 = ctx(0x400, tgt_addr);
 
         let mut g = StreamRelationGraph::new();
-        g.add_structural_candidates(b1, &[(a1, EdgeKind::Control)]);
-        g.add_structural_candidates(b2, &[(a2, EdgeKind::Control)]);
 
-        // Confirm both as Length but supply a relation only to edge-1.
+        // Edge-1 with a relation.
         let rel = Relation { kind: RelKind::Identity };
-        g.confirm_edge(a1, b1, EdgeKind::Length, Some(rel.clone()));
-        g.confirm_edge(a2, b2, EdgeKind::Length, None);
+        g.insert_or_confirm_edge(a1, b1, EdgeKind::Length, Some(rel.clone()));
+
+        // Manually push edge-2 (same address pair, different PCs, no relation).
+        let idx = g.edges.len();
+        g.edges.push(StreamEdge {
+            source: a2,
+            target: b2,
+            kind: EdgeKind::Length,
+            relation: None,
+            value_set: Vec::new(),
+        });
+        // Index manually so governors() can find it.
+        g.outgoing.entry(a2.addr).or_default().push(idx);
+        g.incoming.entry(b2.addr).or_default().push(idx);
 
         // Before backfill: edge-2 has no relation.
         let has_rel_before: Vec<bool> = g.governors(tgt_addr)
@@ -746,24 +613,38 @@ mod tests {
         }
     }
 
-    /// `backfill_length_relations` must NOT touch Structural or non-Length edges.
+    /// `get_governors_by_addr` returns deduplicated (source_addr, kind) pairs
+    /// with highest priority kind when multiple edges share the same source_addr.
     #[test]
-    fn backfill_length_relations_skips_structural_and_non_length_edges() {
-        let src_addr: StreamKey = 0x4001_0000;
-        let tgt_addr: StreamKey = 0x4001_0004;
-        let a = ctx(0x100, src_addr);
-        let b = ctx(0x200, tgt_addr);
-
+    fn get_governors_by_addr_deduplicates_and_picks_highest_priority() {
         let mut g = StreamRelationGraph::new();
-        // Structural Control candidate — not yet confirmed.
-        g.add_structural_candidates(b, &[(a, EdgeKind::Control)]);
+        let tgt_addr: StreamKey = 0x5800_0004;
 
-        let rel = Relation { kind: RelKind::Identity };
-        // Backfill should not touch this edge (it's Structural and Control, not TaintConfirmed Length).
-        g.backfill_length_relations(std::iter::once(((src_addr, tgt_addr), rel)));
+        // Two edges from source_addr_1 to same target: Control and Address.
+        let src1_a = ctx(0x10, 0x5800_0000);
+        let src1_b = ctx(0x11, 0x5800_0000); // same addr, different PC
+        let tgt_a = ctx(0x20, tgt_addr);
+        let tgt_b = ctx(0x21, tgt_addr);
 
-        let edge = g.governors(tgt_addr).next().unwrap();
-        assert!(edge.relation.is_none(), "structural Control edge must not be back-filled");
-        assert_eq!(edge.confidence, Confidence::Structural);
+        g.insert_or_confirm_edge(src1_a, tgt_a, EdgeKind::Control, None);
+        g.insert_or_confirm_edge(src1_b, tgt_b, EdgeKind::Address, None);
+
+        // One edge from source_addr_2 to same target: Control only.
+        let src2 = ctx(0x30, 0x5800_0008);
+        let tgt_c = ctx(0x22, tgt_addr);
+        g.insert_or_confirm_edge(src2, tgt_c, EdgeKind::Control, None);
+
+        let govs = g.get_governors_by_addr(tgt_addr);
+        assert_eq!(govs.len(), 2, "should deduplicate to 2 distinct source addresses");
+
+        // Source 0x5800_0000 should have Address (highest priority among Control and Address).
+        let src1_entry = govs.iter().find(|(addr, _)| *addr == 0x5800_0000);
+        assert!(src1_entry.is_some(), "source_addr_1 must be present");
+        assert_eq!(src1_entry.unwrap().1, EdgeKind::Address, "Address beats Control");
+
+        // Source 0x5800_0008 should have Control (only kind present).
+        let src2_entry = govs.iter().find(|(addr, _)| *addr == 0x5800_0008);
+        assert!(src2_entry.is_some(), "source_addr_2 must be present");
+        assert_eq!(src2_entry.unwrap().1, EdgeKind::Control);
     }
 }

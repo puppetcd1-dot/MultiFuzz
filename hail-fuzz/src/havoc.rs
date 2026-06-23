@@ -340,8 +340,8 @@ impl HavocStage {
         src_bytes[..4].copy_from_slice(&le[..4]);
 
         // Extend target to the boundary size so the execution exercises the edge.
-        // auto_trim_input will shrink it back if the extension added no coverage.
-        if count_b > 0 && count_b <= config::MAX_STREAM_LEN as u64 {
+        // Cap at 4096 to avoid blowing up input size beyond useful limits.
+        if count_b > 0 && count_b <= 4096 {
             let want = count_b as usize;
             let tgt = &mut fuzzer.state.input.streams.entry(target).or_default().bytes;
             if tgt.len() < want {
@@ -741,14 +741,13 @@ mod tests {
         let absent = 0x5800_0008u64;
 
         let mut graph = StreamRelationGraph::new();
-        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
-        graph.confirm_edge(
+        graph.insert_or_confirm_edge(
             ac(0x10, a),
             ac(0x20, b),
             EdgeKind::Length,
             Some(Relation { kind: RelKind::Identity }),
         );
-        graph.add_structural_candidates(ac(0x30, absent), &[(ac(0x10, a), EdgeKind::Control)]);
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x30, absent), EdgeKind::Control, None);
 
         let streams = vec![(a, 4usize), (b, 4usize)];
         let (coupled, length_rel) = build_coupling(&graph, &streams);
@@ -772,7 +771,7 @@ mod tests {
         let a = 0x5800_0000u64;
         let b = 0x5800_0004u64;
         let mut graph = StreamRelationGraph::new();
-        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Control, None);
         graph.set_assist_enabled(false);
 
         let (coupled, length_rel) = build_coupling(&graph, &[(a, 4), (b, 4)]);
@@ -807,7 +806,7 @@ mod tests {
         let a_bytes = vec![0x01u8, 0x02, 0x03, 0x04];
 
         let mut graph = StreamRelationGraph::new();
-        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Control, None);
 
         let corpus = make_corpus_with_entry(a, a_bytes.clone(), b, vec![0xAA]);
         let streams = vec![(a, 4usize), (b, 1usize)];
@@ -828,7 +827,7 @@ mod tests {
         let a = 0x5800_0000u64;
         let b = 0x5800_0004u64;
         let mut graph = StreamRelationGraph::new();
-        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Control, None);
 
         // Corpus entry where B is EMPTY.
         let corpus = make_corpus_with_entry(a, vec![0x01, 0x02], b, vec![]);
@@ -847,7 +846,7 @@ mod tests {
         let a = 0x5800_0000u64;
         let b = 0x5800_0004u64;
         let mut graph = StreamRelationGraph::new();
-        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Control, None);
         graph.set_assist_enabled(false);
 
         let corpus = make_corpus_with_entry(a, vec![0x01], b, vec![0xAA]);
@@ -865,8 +864,7 @@ mod tests {
         let b = 0x5800_0004u64;
 
         let mut graph = StreamRelationGraph::new();
-        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
-        graph.confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Control, None);
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Control, None);
         graph.record_discriminant(a, b, 3);
         graph.record_discriminant(a, b, 7);
 
@@ -889,9 +887,8 @@ mod tests {
         let b = 0x5800_0004u64;
 
         let mut graph = StreamRelationGraph::new();
-        graph.add_structural_candidates(ac(0x20, b), &[(ac(0x10, a), EdgeKind::Control)]);
-        // Reclassify to Length: a discriminant recorded now must be ignored.
-        graph.confirm_edge(
+        // Insert as Length: a discriminant recorded now must be ignored.
+        graph.insert_or_confirm_edge(
             ac(0x10, a),
             ac(0x20, b),
             EdgeKind::Length,

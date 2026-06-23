@@ -13,6 +13,7 @@ use crate::{
         log_cmplog_data,
     },
     input::{MultiStream, StreamKey},
+    stream_relation::EdgeKind,
     utils::{get_non_empty_streams, get_stream_weights, insert_slice, replace_slice_strided},
 };
 
@@ -201,6 +202,12 @@ impl I2SReplaceStage {
                 .unwrap();
             }
         }
+
+        feed_cmplog_discriminants(
+            &mut fuzzer.relation_graph,
+            &fuzzer.state.input,
+            &comparisons,
+        );
 
         // For all non-empty streams, extend them a bit to avoid cases where changes that we make
         // exit due to reaching the end of the input.
@@ -477,4 +484,62 @@ fn log_attempted_replacements(
     }
 
     Ok(())
+}
+
+fn feed_cmplog_discriminants(
+    graph: &mut crate::stream_relation::StreamRelationGraph,
+    input: &MultiStream,
+    comparisons: &Comparisons,
+) {
+    if !graph.assist_enabled() {
+        return;
+    }
+    let control_pairs: Vec<(StreamKey, StreamKey)> = graph
+        .confirmed_edges()
+        .filter(|e| e.kind == EdgeKind::Control)
+        .map(|e| (e.source.addr, e.target.addr))
+        .collect();
+    if control_pairs.is_empty() {
+        return;
+    }
+
+    for (src_addr, tgt_addr) in control_pairs {
+        let Some(stream) = input.streams.get(&src_addr) else { continue };
+        if stream.bytes.is_empty() {
+            continue;
+        }
+
+        for &(_, (a, b)) in &comparisons.u32 {
+            let a_le = a.to_le_bytes();
+            let b_le = b.to_le_bytes();
+            if stream.bytes.len() >= 4 {
+                if stream.bytes.windows(4).any(|w| w == a_le) {
+                    graph.record_discriminant(src_addr, tgt_addr, b as u64);
+                }
+                if stream.bytes.windows(4).any(|w| w == b_le) {
+                    graph.record_discriminant(src_addr, tgt_addr, a as u64);
+                }
+            }
+        }
+        for &(_, (a, b)) in &comparisons.u16 {
+            let a_le = a.to_le_bytes();
+            let b_le = b.to_le_bytes();
+            if stream.bytes.len() >= 2 {
+                if stream.bytes.windows(2).any(|w| w == a_le) {
+                    graph.record_discriminant(src_addr, tgt_addr, b as u64);
+                }
+                if stream.bytes.windows(2).any(|w| w == b_le) {
+                    graph.record_discriminant(src_addr, tgt_addr, a as u64);
+                }
+            }
+        }
+        for &(_, (a, b)) in &comparisons.u8 {
+            if stream.bytes.contains(&a) {
+                graph.record_discriminant(src_addr, tgt_addr, b as u64);
+            }
+            if stream.bytes.contains(&b) {
+                graph.record_discriminant(src_addr, tgt_addr, a as u64);
+            }
+        }
+    }
 }

@@ -545,7 +545,9 @@ impl PhaseBEngine {
                         }
                         _ => None,
                     };
-                    self.set_def(stmt.output, c, ta.union(&tb));
+                    // Taint narrowing: skip union when both inputs are clean.
+                    let t = if ta.is_clean() && tb.is_clean() { TaintTag::Clean } else { ta.union(&tb) };
+                    self.set_def(stmt.output, c, t);
                 }
 
                 Op::IntEqual | Op::IntNotEqual => {
@@ -558,7 +560,9 @@ impl PhaseBEngine {
                         (Some(x), Some(y)) => eval_cmp(stmt.op, x, y, size),
                         _ => None,
                     };
-                    self.set_def(stmt.output, c, ta.union(&tb));
+                    // Taint narrowing: skip union when both inputs are clean.
+                    let t = if ta.is_clean() && tb.is_clean() { TaintTag::Clean } else { ta.union(&tb) };
+                    self.set_def(stmt.output, c, t);
                     if !stmt.output.is_invalid() {
                         self.def_eq_derived.insert(stmt.output.id);
                     }
@@ -578,14 +582,18 @@ impl PhaseBEngine {
                         (Some(x), Some(y)) => eval_cmp(stmt.op, x, y, size),
                         _ => None,
                     };
-                    self.set_def(stmt.output, c, ta.union(&tb));
+                    // Taint narrowing: skip union when both inputs are clean.
+                    let t = if ta.is_clean() && tb.is_clean() { TaintTag::Clean } else { ta.union(&tb) };
+                    self.set_def(stmt.output, c, t);
                 }
 
                 Op::IntDiv | Op::IntSignedDiv | Op::IntRem | Op::IntSignedRem
                 | Op::IntRotateLeft | Op::IntRotateRight => {
                     let ta = self.taint_in(stmt.inputs.first());
                     let tb = self.taint_in(stmt.inputs.second());
-                    self.set_def(stmt.output, None, ta.union(&tb));
+                    // Taint narrowing: skip union when both inputs are clean.
+                    let t = if ta.is_clean() && tb.is_clean() { TaintTag::Clean } else { ta.union(&tb) };
+                    self.set_def(stmt.output, None, t);
                 }
 
                 Op::IntNot | Op::IntNegate | Op::IntCountOnes | Op::IntCountLeadingZeroes => {
@@ -668,7 +676,7 @@ pub fn apply_pass_result(
     result: PassResult,
 ) {
     for (src, tgt) in result.address_edges {
-        graph.confirm_edge(src, tgt, EdgeKind::Address, None);
+        graph.insert_or_confirm_edge(src, tgt, EdgeKind::Address, None);
     }
     for obs in result.control_edges {
         if obs.is_length {
@@ -676,9 +684,10 @@ pub fn apply_pass_result(
                 Some(sample) => store.record((obs.source, obs.target), sample),
                 None => None,
             };
-            graph.confirm_edge(obs.source, obs.target, EdgeKind::Length, relation);
-        } else if graph.confirm_edge(obs.source, obs.target, EdgeKind::Control, None) {
-            // Only equality-gated (cmd==3, not size<256) backed observations record discriminants.
+            graph.insert_or_confirm_edge(obs.source, obs.target, EdgeKind::Length, relation);
+        } else {
+            graph.insert_or_confirm_edge(obs.source, obs.target, EdgeKind::Control, None);
+            // Only equality-gated (cmd==3, not size<256) observations record discriminants.
             if obs.is_eq {
                 if let Some((val, _count)) = obs.sample {
                     graph.record_discriminant(obs.source.addr, obs.target.addr, val);
@@ -898,7 +907,7 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream_relation::Confidence;
+    // Confidence enum removed: all edges are taint-confirmed.
     use icicle_vm::cpu::lifter::{Block, BlockExit, Target};
     use pcode::VarNode;
 
@@ -1140,8 +1149,6 @@ mod tests {
         let src_b = AccessContext::new(0x200, 0x5800_0008); // same addr, different PC
         let tgt   = AccessContext::new(0x300, 0x5800_0000);
 
-        graph.add_structural_candidates(tgt, &[(src_a, EdgeKind::Control)]);
-
         // Pass 1: sample from PC 0x100 → (4, 4)
         apply_pass_result(&mut graph, &mut store, PassResult {
             address_edges: vec![],
@@ -1175,7 +1182,6 @@ mod tests {
 
         let src = AccessContext::new(0x200, 0x5800_0008);
         let tgt = AccessContext::new(0x300, 0x5800_0000);
-        graph.add_structural_candidates(tgt, &[(src, EdgeKind::Control)]);
 
         for v in [4u64, 7u64] {
             apply_pass_result(&mut graph, &mut store, PassResult {
@@ -1190,7 +1196,6 @@ mod tests {
         let edge = graph.confirmed_edges().find(|e| e.source == src && e.target == tgt)
             .expect("edge should be confirmed");
         assert_eq!(edge.kind, EdgeKind::Length);
-        assert_eq!(edge.confidence, Confidence::TaintConfirmed);
         assert!(edge.relation.is_some());
     }
 
@@ -1205,7 +1210,6 @@ mod tests {
 
         let src = AccessContext::new(0x200, 0x5800_0008);
         let tgt = AccessContext::new(0x300, 0x5800_0000);
-        graph.add_structural_candidates(tgt, &[(src, EdgeKind::Control)]);
 
         // One pass reports the SAME source on both channels (address + gating).
         apply_pass_result(&mut graph, &mut store, PassResult {
@@ -1231,7 +1235,6 @@ mod tests {
 
         let src = AccessContext::new(0x200, 0x5800_0008);
         let tgt = AccessContext::new(0x300, 0x5800_0000);
-        graph.add_structural_candidates(tgt, &[(src, EdgeKind::Control)]);
 
         // Pass 1: is_eq=true → value 3 must be recorded.
         apply_pass_result(&mut graph, &mut store, PassResult {
@@ -1258,9 +1261,10 @@ mod tests {
         assert!(!vals.contains(&42), "range-check value must not be captured as discriminant");
     }
 
-    /// An unbacked Control observation records no discriminant.
+    /// A Control observation without a prior structural candidate now directly
+    /// inserts an edge via `insert_or_confirm_edge`.
     #[test]
-    fn apply_results_no_discriminant_without_structural_backing() {
+    fn apply_results_inserts_edge_without_structural_backing() {
         let mut graph = StreamRelationGraph::new();
         let mut store = LengthSampleStore::new();
         let src = AccessContext::new(0x200, 0x5800_0008);
@@ -1272,7 +1276,7 @@ mod tests {
                 sample: Some((9, 1)),
             }],
         });
-        assert_eq!(graph.edge_count(), 0, "unbacked observation invents no edge");
+        assert!(graph.edge_count() > 0, "observation must directly insert an edge");
     }
 
     /// Deferred source-value capture from the next block entry (production LiveEnv path).

@@ -9,7 +9,6 @@ use crate::{
     input::{MultiStream, StreamKey},
     monitor,
     mutations::extend_input_by_rand,
-    stream_relation::AccessContext,
     DictionaryRef, Fuzzer, FuzzerStage, Snapshot, Stage, StageExit,
 };
 
@@ -318,13 +317,12 @@ impl FuzzerStage for MultiStreamExtendStage {
                         fuzzer.get_extension_factor(addr)
                     });
 
-                    // Phase A: structural MMIO dependency inference, keyed by the full
-                    // access context `(addr, readwatch_pc)` across the whole campaign.
+                    // Record MMIO read sites for Phase A frontier weight computation
+                    // (no longer generates edges — Phase B is the sole edge source).
                     let readwatch_pc = fuzzer.vm.cpu.read_pc();
                     let lifted_blocks = fuzzer.vm.code.blocks.len();
                     let trigger = fuzzer.mmio_flow.trigger(addr, readwatch_pc, lifted_blocks);
                     if trigger.run_slice {
-                        let target_ctx = AccessContext::new(readwatch_pc, addr);
                         let sites: Vec<(u64, StreamKey)> = fuzzer
                             .target
                             .get_mmio_handler(&mut fuzzer.vm)
@@ -333,27 +331,9 @@ impl FuzzerStage for MultiStreamExtendStage {
                         for (pc, key) in sites {
                             fuzzer.mmio_flow.record_read_site(pc, key);
                         }
-                        let candidates = fuzzer
-                            .mmio_flow
-                            .candidates_for_new_stream(readwatch_pc, &fuzzer.vm.code);
-                        if !candidates.is_empty() {
-                            tracing::debug!(
-                                "Phase A: MMIO {addr:#x} at PC {readwatch_pc:#x} \
-                                 (first_seen={}) — {} structural candidate(s): {:?}",
-                                trigger.first_seen, candidates.len(), candidates
-                            );
-                            fuzzer.relation_graph.add_structural_candidates(target_ctx, &candidates);
-
-                            if std::env::var_os("DUMP_RELATIONS").is_some() {
-                                let _ = std::fs::write(
-                                    fuzzer.workdir.join("relations.json"),
-                                    fuzzer.relation_graph.to_json(),
-                                );
-                            }
-                        }
                     }
 
-                    // Phase B: sample whether to run a dynamic taint pass.
+                    // Phase B trigger: new MMIO address OR first-seen context.
                     if (trigger.first_seen || new_mmio_addr) && fuzzer.phase_b.is_some() {
                         let rate: u64 = std::env::var("PHASE_B_RATE")
                             .ok()
@@ -383,9 +363,15 @@ impl FuzzerStage for MultiStreamExtendStage {
             save_metadata(fuzzer, &state);
             fuzzer.update_stats(stats);
 
-            // Phase B taint pass runs here, at the end of the iteration: it re-executes the seed
-            // and overwrites `fuzzer.state`/VM state, but the next `exec_one` restores the prefix
-            // snapshot and re-clones the current input, so the stage state machine recovers.
+            // Hybrid trigger: if this execution hit a frontier branch but did not
+            // produce new coverage, trigger Phase B to discover dependencies that
+            // may help unlock the uncovered successor.
+            if !do_phase_b && fuzzer.phase_b.is_some() && !fuzzer.state.new_coverage {
+                if fuzzer.check_frontier_hit() {
+                    do_phase_b = true;
+                }
+            }
+
             if do_phase_b {
                 fuzzer.run_phase_b_pass();
                 if std::env::var_os("DUMP_RELATIONS").is_some() {
