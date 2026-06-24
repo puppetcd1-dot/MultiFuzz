@@ -69,6 +69,12 @@ pub(crate) struct HavocStage {
     /// value known to discriminate the branch, unlocking targets that may not even
     /// be present yet (the new-coverage case).
     discriminants: HashMap<StreamKey, Vec<u64>>,
+    /// For each source stream address, the `[start, end)` byte ranges its read contexts
+    /// consumed in the most recent execution.  Directional writes (discriminant
+    /// injection, overflow probe, splice) target one of these offsets so the value lands
+    /// where the governing context actually reads, instead of always at byte 0.  Refreshed
+    /// from the per-input slice ledger after each attempt; empty until the first execution.
+    context_slices: HashMap<StreamKey, Vec<(u32, u32)>>,
 
     log2_max_mutations: u32,
     max_mutations: u32,
@@ -140,6 +146,7 @@ impl StageData for HavocStage {
             length_rel,
             splice_candidates,
             discriminants,
+            context_slices: HashMap::new(),
             saved: false,
         })
     }
@@ -171,6 +178,20 @@ impl StageData for HavocStage {
 
         fuzzer.write_input_to_target().unwrap();
         let exit = fuzzer.execute()?;
+
+        // Refresh the per-address slice map from the just-executed run's context ledger,
+        // so subsequent attempts can target directional writes at the bytes each governing
+        // context actually reads.
+        if let Some(handler) = fuzzer.target.get_mmio_handler(&mut fuzzer.vm) {
+            self.context_slices.clear();
+            for (&(_pc, addr), ranges) in &handler.source.read_slices {
+                self.context_slices.entry(addr).or_default().extend(ranges.iter().copied());
+            }
+            for ranges in self.context_slices.values_mut() {
+                ranges.sort_unstable();
+                ranges.dedup();
+            }
+        }
 
         // Keep track of the streams that cause us to exit because they are too small.
         if let Some(key) = fuzzer.state.input.last_read {
@@ -331,13 +352,15 @@ impl HavocStage {
         let delta: i64 = [-1i64, 0, 0, 1][fuzzer.rng.gen_range(0..4)];
         let probe_val = (val_a as i64).saturating_add(delta).max(0) as u64;
 
-        // Write probe_val into source stream (little-endian, first 4 bytes).
+        // Write probe_val little-endian at the source context's slice offset (the bytes
+        // the length-governing read consumes), growing the stream if the word would not fit.
+        let off = self.slice_start(&mut fuzzer.rng, source);
         let src_bytes = &mut fuzzer.state.input.streams.entry(source).or_default().bytes;
-        if src_bytes.len() < 4 {
-            src_bytes.resize(4, 0);
+        if src_bytes.len() < off + 4 {
+            src_bytes.resize(off + 4, 0);
         }
         let le = probe_val.to_le_bytes();
-        src_bytes[..4].copy_from_slice(&le[..4]);
+        src_bytes[off..off + 4].copy_from_slice(&le[..4]);
 
         // Extend target to the boundary size so the execution exercises the edge.
         // Cap at 4096 to avoid blowing up input size beyond useful limits.
@@ -369,24 +392,34 @@ impl HavocStage {
             return;
         }
 
+        // Begin the splice at the governing context's slice offset, aligning donor and
+        // current bytes by absolute position (same stream address ⇒ comparable offsets),
+        // so the bytes the governing read consumes are seeded with proven-working values.
+        let off = self.slice_start(&mut fuzzer.rng, key).min(donor.len() - 1);
+        let avail = donor.len() - off;
+        let splice_len = fuzzer.rng.gen_range(1..=avail);
         let bytes = &mut fuzzer.state.input.streams.entry(key).or_default().bytes;
-        // Splice up to the full donor length or a random sub-prefix.
-        let max_splice = donor.len();
-        let splice_len = fuzzer.rng.gen_range(1..=max_splice);
-        if bytes.len() < splice_len {
-            bytes.resize(splice_len, 0);
+        if bytes.len() < off + splice_len {
+            bytes.resize(off + splice_len, 0);
         }
-        bytes[..splice_len].copy_from_slice(&donor[..splice_len]);
+        bytes[off..off + splice_len].copy_from_slice(&donor[off..off + splice_len]);
     }
 
-    /// DISCRIMINANT INJECTION: overwrite the leading word of `key`'s stream with a
-    /// concrete gating value Phase B observed to open the path to a governed target.
+    /// Choose a byte offset within `key`'s stream to target a directional write, drawn
+    /// from the read slices the governing context(s) consumed in the last execution.
+    /// Falls back to offset 0 when no slice is known (e.g. before the first execution).
+    fn slice_start(&self, rng: &mut impl Rng, key: StreamKey) -> usize {
+        pick_slice_start(&self.context_slices, rng, key)
+    }
+
+    /// DISCRIMINANT INJECTION: overwrite the gating word of `key`'s stream with a
+    /// concrete value Phase B observed to open the path to a governed target.
     ///
-    /// The value is written little-endian over `min(len, 4)` leading bytes — the
-    /// width a typical MMIO read consumes — so a narrow read sees the low byte(s)
-    /// and a word read sees the whole value.  No bytes beyond the first word are
-    /// touched, leaving any subsequent reads from the same stream intact.  The
-    /// stream is never created or grown here: an absent/empty source has nothing to
+    /// The value is written little-endian over `min(remaining, 4)` bytes starting at the
+    /// governing context's slice offset — the bytes that read actually consumes — so a
+    /// narrow read sees the low byte(s) and a word read sees the whole value.  Bytes
+    /// outside that word are left intact, preserving any other reads from the same stream.
+    /// The stream is never created or grown here: an absent/empty source has nothing to
     /// gate with, and growing it is the job of the normal extension path.
     fn inject_discriminant(&mut self, fuzzer: &mut Fuzzer, key: StreamKey) {
         let Some(values) = self.discriminants.get(&key) else { return };
@@ -394,14 +427,16 @@ impl HavocStage {
             return;
         }
         let value = values[fuzzer.rng.gen_range(0..values.len())];
+        let off = self.slice_start(&mut fuzzer.rng, key);
 
         let bytes = &mut fuzzer.state.input.streams.entry(key).or_default().bytes;
         if bytes.is_empty() {
             return;
         }
-        let width = bytes.len().min(4);
+        let off = off.min(bytes.len() - 1);
+        let width = (bytes.len() - off).min(4);
         let le = value.to_le_bytes();
-        bytes[..width].copy_from_slice(&le[..width]);
+        bytes[off..off + width].copy_from_slice(&le[..width]);
     }
 
     #[allow(unused)]
@@ -709,6 +744,19 @@ fn boundary_counts(current_len: usize) -> Vec<u64> {
     counts
 }
 
+/// Pick a byte offset for a directional write into `key`'s stream, drawn from the read
+/// slices the governing context(s) consumed.  Returns 0 when no slice is recorded.
+fn pick_slice_start(
+    context_slices: &HashMap<StreamKey, Vec<(u32, u32)>>,
+    rng: &mut impl Rng,
+    key: StreamKey,
+) -> usize {
+    match context_slices.get(&key).filter(|r| !r.is_empty()) {
+        Some(ranges) => ranges[rng.gen_range(0..ranges.len())].0 as usize,
+        None => 0,
+    }
+}
+
 /// Interpret the leading bytes of a stream as a little-endian unsigned integer.
 /// Reads up to 8 bytes.
 fn le_value(bytes: &[u8]) -> u64 {
@@ -942,5 +990,28 @@ mod tests {
         assert_eq!(le_value(&[0x04, 0x00, 0x00, 0x00]), 4);
         assert_eq!(le_value(&[0x00, 0x01]), 256);
         assert_eq!(le_value(&[]), 0);
+    }
+
+    // ── pick_slice_start ──────────────────────────────────────────────────────
+
+    /// Directional writes target a recorded context slice offset, and fall back to 0
+    /// when the stream has no recorded slices.
+    #[test]
+    fn pick_slice_start_uses_recorded_ranges_else_zero() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+
+        let a = 0x5800_0000u64;
+        let b = 0x5800_0004u64;
+        let mut slices: HashMap<StreamKey, Vec<(u32, u32)>> = HashMap::new();
+        // `a` was read once starting at offset 8; `b` has no recorded slice.
+        slices.insert(a, vec![(8, 12)]);
+
+        assert_eq!(pick_slice_start(&slices, &mut rng, a), 8, "targets the recorded slice start");
+        assert_eq!(pick_slice_start(&slices, &mut rng, b), 0, "unknown stream falls back to 0");
+
+        // A stream whose only recorded range is empty also falls back to 0.
+        slices.insert(b, vec![]);
+        assert_eq!(pick_slice_start(&slices, &mut rng, b), 0, "empty range list falls back to 0");
     }
 }
