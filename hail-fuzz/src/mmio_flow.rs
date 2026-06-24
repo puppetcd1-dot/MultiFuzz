@@ -562,7 +562,7 @@ pub fn compute_frontier_stream_weights(
     accum.into_iter()
         .map(|(k, raw)| {
             let stag = stagnation.get(&k).copied().unwrap_or(0);
-            let penalty = STAGNATION_DECAY.powi(stag as i32);
+            let penalty = STAGNATION_DECAY.powf(stag as f64);
             (k, 1.0 + raw * penalty)
         })
         .collect()
