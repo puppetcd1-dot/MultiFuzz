@@ -158,12 +158,19 @@ impl StreamRelationGraph {
 
     /// Insert a new taint-confirmed edge, or upgrade an existing one.
     ///
-    /// - If an edge with the same `(source, target)` exists: upgrade kind if higher
-    ///   priority (Address > Length > Control), merge relation (keep existing if new
-    ///   is None; update if new is Some), don't downgrade kind.
-    /// - If no exact match but same `(source.addr, target.addr)` pair exists: same
-    ///   upgrade logic.
-    /// - If no edge exists at all: create a new edge and index it.
+    /// Edges are **context-granular**: the node identity is the full `AccessContext`
+    /// `(pc, addr)`, so two reads of the same MMIO address from different instruction
+    /// PCs are distinct nodes with their own edge sets.  This preserves the dependency
+    /// context that an address-only merge would otherwise collapse.
+    ///
+    /// - If an edge with the same `(source, target)` context exists: upgrade kind if
+    ///   higher priority (Address > Length > Control), merge relation (keep existing if
+    ///   new is None; update if new is Some), don't downgrade kind.
+    /// - Otherwise: create a new edge and index it.
+    ///
+    /// Redundant context nodes (same address, identical edge sets) are folded back
+    /// together out-of-band by [`merge_equivalent_contexts`], which bounds graph growth
+    /// without losing the per-context distinction where it matters.
     pub fn insert_or_confirm_edge(
         &mut self,
         source: AccessContext,
@@ -171,19 +178,11 @@ impl StreamRelationGraph {
         kind: EdgeKind,
         relation: Option<Relation>,
     ) {
-        // Try exact context match first.
+        // Exact context match only — distinct (pc, addr) contexts stay distinct nodes.
         if let Some(indices) = self.incoming.get(&target.addr).cloned() {
             for &idx in &indices {
                 let edge = &self.edges[idx];
                 if edge.source == source && edge.target == target {
-                    Self::upgrade_edge(&mut self.edges[idx], kind, relation);
-                    return;
-                }
-            }
-            // Fall back to address-pair match.
-            for &idx in &indices {
-                let edge = &self.edges[idx];
-                if edge.source.addr == source.addr {
                     Self::upgrade_edge(&mut self.edges[idx], kind, relation);
                     return;
                 }
@@ -622,6 +621,31 @@ mod tests {
                 "all Length edges for address pair must have a relation after backfill"
             );
         }
+    }
+
+    /// Context granularity: two edges over the same address pair but from different
+    /// instruction PCs are kept as distinct nodes (no address-pair merge), while the
+    /// address-level aggregation still collapses them for the mutation engine.
+    #[test]
+    fn distinct_pcs_at_same_address_stay_distinct_nodes() {
+        let mut g = StreamRelationGraph::new();
+        let a_addr: StreamKey = 0x4001_0000;
+        let b_addr: StreamKey = 0x4001_0004;
+
+        // Same (src_addr, tgt_addr) pair, different PCs → must NOT merge.
+        g.insert_or_confirm_edge(ctx(0x100, a_addr), ctx(0x200, b_addr), EdgeKind::Control, None);
+        g.insert_or_confirm_edge(ctx(0x300, a_addr), ctx(0x200, b_addr), EdgeKind::Address, None);
+
+        assert_eq!(g.edge_count(), 2, "different source PCs must produce two distinct edges");
+
+        // Re-confirming the exact same context upgrades in place rather than adding.
+        g.insert_or_confirm_edge(ctx(0x100, a_addr), ctx(0x200, b_addr), EdgeKind::Address, None);
+        assert_eq!(g.edge_count(), 2, "re-confirming an existing context must not add an edge");
+
+        // Address-level aggregation still presents a single deduplicated governor.
+        let govs = g.get_governors_by_addr(b_addr);
+        assert_eq!(govs.len(), 1, "aggregation collapses both contexts to one source address");
+        assert_eq!(govs[0], (a_addr, EdgeKind::Address));
     }
 
     /// `get_governors_by_addr` returns deduplicated (source_addr, kind) pairs
