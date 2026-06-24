@@ -5,7 +5,7 @@ use rand_distr::{Distribution, WeightedAliasIndex};
 
 use crate::{
     calculate_energy, config,
-    input::{MultiStream, StreamKey},
+    input::{MultiStream, ReadContext, StreamKey},
     mutations::{self, Mutation, ALL_MUTATIONS},
     queue::CorpusStore,
     stream_relation::{EdgeKind, Relation, StreamRelationGraph},
@@ -56,25 +56,22 @@ pub(crate) struct HavocStage {
     /// also present and non-empty in this input — candidates for coupled mutation.
     coupled: HashMap<StreamKey, Vec<StreamKey>>,
     /// For each Length-source stream, the governed targets with fitted relations.
-    /// Used both for length preservation (keeping B sized to g(val_A)) and for
-    /// OVERFLOW-PROBE (setting A to g_inv(boundary)).
-    length_rel: HashMap<StreamKey, Vec<(StreamKey, Relation)>>,
+    /// Each entry carries the source context PC so OVERFLOW-PROBE writes at the
+    /// byte offset the governing context actually reads.
+    length_rel: HashMap<StreamKey, Vec<(u64, StreamKey, Relation)>>,
     /// For each stream A, working byte sequences extracted from corpus entries
     /// where at least one of A's Control/Address governed targets was non-empty.
-    /// Splice mutation uses these to inject proven-working values for A so the
-    /// execution starts from a configuration that previously unlocked B.
-    splice_candidates: HashMap<StreamKey, Vec<Vec<u8>>>,
-    /// For each Control-source stream, the concrete gating values Phase B observed
-    /// to open the path to a governed target.  Injecting one sets the source to a
-    /// value known to discriminate the branch, unlocking targets that may not even
-    /// be present yet (the new-coverage case).
-    discriminants: HashMap<StreamKey, Vec<u64>>,
-    /// For each source stream address, the `[start, end)` byte ranges its read contexts
-    /// consumed in the most recent execution.  Directional writes (discriminant
-    /// injection, overflow probe, splice) target one of these offsets so the value lands
-    /// where the governing context actually reads, instead of always at byte 0.  Refreshed
-    /// from the per-input slice ledger after each attempt; empty until the first execution.
-    context_slices: HashMap<StreamKey, Vec<(u32, u32)>>,
+    /// Each entry carries the source context PC for slice-targeted writes.
+    splice_candidates: HashMap<StreamKey, Vec<(u64, Vec<u8>)>>,
+    /// For each Control-source stream, `(source_pc, gating_value)` pairs Phase B
+    /// observed to open the path to a governed target.  The source PC targets the
+    /// injection at the bytes the governing context reads.
+    discriminants: HashMap<StreamKey, Vec<(u64, u64)>>,
+    /// Per-context `[start, end)` byte ranges from the most recent execution, keyed
+    /// by `(pc, addr)`.  Directional writes look up the exact source context's slice
+    /// so the value lands where the governing read consumes, instead of aggregating
+    /// by address.  Refreshed from the handler's slice ledger after each attempt.
+    read_slices: HashMap<ReadContext, Vec<(u32, u32)>>,
 
     log2_max_mutations: u32,
     max_mutations: u32,
@@ -146,7 +143,7 @@ impl StageData for HavocStage {
             length_rel,
             splice_candidates,
             discriminants,
-            context_slices: HashMap::new(),
+            read_slices: HashMap::new(),
             saved: false,
         })
     }
@@ -179,18 +176,10 @@ impl StageData for HavocStage {
         fuzzer.write_input_to_target().unwrap();
         let exit = fuzzer.execute()?;
 
-        // Refresh the per-address slice map from the just-executed run's context ledger,
-        // so subsequent attempts can target directional writes at the bytes each governing
-        // context actually reads.
+        // Copy the per-context slice ledger from the just-executed run so directional
+        // writes target the exact bytes each governing context reads.
         if let Some(handler) = fuzzer.target.get_mmio_handler(&mut fuzzer.vm) {
-            self.context_slices.clear();
-            for (&(_pc, addr), ranges) in &handler.source.read_slices {
-                self.context_slices.entry(addr).or_default().extend(ranges.iter().copied());
-            }
-            for ranges in self.context_slices.values_mut() {
-                ranges.sort_unstable();
-                ranges.dedup();
-            }
+            self.read_slices.clone_from(&handler.source.read_slices);
         }
 
         // Keep track of the streams that cause us to exit because they are too small.
@@ -225,7 +214,7 @@ impl HavocStage {
             // (0, 1, current_len±1, 2^n …) by solving A = g_inv(boundary) and
             // extending B to that size.  This synthesises boundary-condition inputs
             // directly instead of waiting for random mutation to reach them.
-            let probe_target: Option<(StreamKey, Relation)> = {
+            let probe_target: Option<(u64, StreamKey, Relation)> = {
                 let has_length =
                     self.length_rel.get(&key).map_or(false, |r| !r.is_empty());
                 if has_length && fuzzer.rng.gen_bool(OVERFLOW_PROBE_PROB) {
@@ -237,8 +226,8 @@ impl HavocStage {
                 }
             };
 
-            if let Some((target, rel)) = probe_target {
-                self.overflow_probe(fuzzer, key, target, &rel);
+            if let Some((src_pc, target, rel)) = probe_target {
+                self.overflow_probe(fuzzer, key, src_pc, target, &rel);
             } else {
                 // DISCRIMINANT INJECTION: if this stream is a Control source with
                 // known gating values, set it to one of them (with
@@ -309,8 +298,8 @@ impl HavocStage {
         let relation = self
             .length_rel
             .get(&source)
-            .and_then(|v| v.iter().find(|(t, _)| *t == target))
-            .map(|(_, r)| r.clone());
+            .and_then(|v| v.iter().find(|(_, t, _)| *t == target))
+            .map(|(_, _, r)| r.clone());
         let Some(relation) = relation else { return };
 
         let data = &mut fuzzer.state.input;
@@ -338,6 +327,7 @@ impl HavocStage {
         &mut self,
         fuzzer: &mut Fuzzer,
         source: StreamKey,
+        src_pc: u64,
         target: StreamKey,
         rel: &Relation,
     ) {
@@ -354,7 +344,7 @@ impl HavocStage {
 
         // Write probe_val little-endian at the source context's slice offset (the bytes
         // the length-governing read consumes), growing the stream if the word would not fit.
-        let off = self.slice_start(&mut fuzzer.rng, source);
+        let off = self.slice_start(&mut fuzzer.rng, (src_pc, source));
         let src_bytes = &mut fuzzer.state.input.streams.entry(source).or_default().bytes;
         if src_bytes.len() < off + 4 {
             src_bytes.resize(off + 4, 0);
@@ -386,8 +376,8 @@ impl HavocStage {
             return;
         }
         let donor_idx = fuzzer.rng.gen_range(0..donors.len());
-        // Clone donor bytes to avoid conflicting borrows of self.
-        let donor = donors[donor_idx].clone();
+        // Clone to avoid conflicting borrows of self.
+        let (src_pc, donor) = donors[donor_idx].clone();
         if donor.is_empty() {
             return;
         }
@@ -395,7 +385,7 @@ impl HavocStage {
         // Begin the splice at the governing context's slice offset, aligning donor and
         // current bytes by absolute position (same stream address ⇒ comparable offsets),
         // so the bytes the governing read consumes are seeded with proven-working values.
-        let off = self.slice_start(&mut fuzzer.rng, key).min(donor.len() - 1);
+        let off = self.slice_start(&mut fuzzer.rng, (src_pc, key)).min(donor.len() - 1);
         let avail = donor.len() - off;
         let splice_len = fuzzer.rng.gen_range(1..=avail);
         let bytes = &mut fuzzer.state.input.streams.entry(key).or_default().bytes;
@@ -405,11 +395,11 @@ impl HavocStage {
         bytes[off..off + splice_len].copy_from_slice(&donor[off..off + splice_len]);
     }
 
-    /// Choose a byte offset within `key`'s stream to target a directional write, drawn
-    /// from the read slices the governing context(s) consumed in the last execution.
+    /// Choose a byte offset within a stream to target a directional write, drawn
+    /// from the read slices the specific source context consumed in the last execution.
     /// Falls back to offset 0 when no slice is known (e.g. before the first execution).
-    fn slice_start(&self, rng: &mut impl Rng, key: StreamKey) -> usize {
-        pick_slice_start(&self.context_slices, rng, key)
+    fn slice_start(&self, rng: &mut impl Rng, ctx: ReadContext) -> usize {
+        pick_slice_start(&self.read_slices, rng, ctx)
     }
 
     /// DISCRIMINANT INJECTION: overwrite the gating word of `key`'s stream with a
@@ -426,8 +416,8 @@ impl HavocStage {
         if values.is_empty() {
             return;
         }
-        let value = values[fuzzer.rng.gen_range(0..values.len())];
-        let off = self.slice_start(&mut fuzzer.rng, key);
+        let &(src_pc, value) = &values[fuzzer.rng.gen_range(0..values.len())];
+        let off = self.slice_start(&mut fuzzer.rng, (src_pc, key));
 
         let bytes = &mut fuzzer.state.input.streams.entry(key).or_default().bytes;
         if bytes.is_empty() {
@@ -583,9 +573,9 @@ impl HavocMutator {
 fn build_coupling(
     graph: &StreamRelationGraph,
     streams: &[(StreamKey, usize)],
-) -> (HashMap<StreamKey, Vec<StreamKey>>, HashMap<StreamKey, Vec<(StreamKey, Relation)>>) {
+) -> (HashMap<StreamKey, Vec<StreamKey>>, HashMap<StreamKey, Vec<(u64, StreamKey, Relation)>>) {
     let mut coupled: HashMap<StreamKey, Vec<StreamKey>> = HashMap::new();
-    let mut length_rel: HashMap<StreamKey, Vec<(StreamKey, Relation)>> = HashMap::new();
+    let mut length_rel: HashMap<StreamKey, Vec<(u64, StreamKey, Relation)>> = HashMap::new();
     if !graph.assist_enabled() {
         return (coupled, length_rel);
     }
@@ -599,12 +589,13 @@ fn build_coupling(
             }
             coupled.entry(key).or_default().push(target);
             if kind == EdgeKind::Length {
-                // Retrieve the fitted relation from the underlying edge.
                 for edge in graph.dependents(key) {
                     if edge.target.addr == target && edge.kind == EdgeKind::Length {
                         if let Some(rel) = &edge.relation {
-                            length_rel.entry(key).or_default().push((target, rel.clone()));
-                            break;
+                            length_rel
+                                .entry(key)
+                                .or_default()
+                                .push((edge.source.pc, target, rel.clone()));
                         }
                     }
                 }
@@ -641,8 +632,8 @@ fn collect_splice_candidates(
     graph: &StreamRelationGraph,
     streams: &[(StreamKey, usize)],
     corpus: &CorpusStore<MultiStream>,
-) -> HashMap<StreamKey, Vec<Vec<u8>>> {
-    let mut candidates: HashMap<StreamKey, Vec<Vec<u8>>> = HashMap::new();
+) -> HashMap<StreamKey, Vec<(u64, Vec<u8>)>> {
+    let mut candidates: HashMap<StreamKey, Vec<(u64, Vec<u8>)>> = HashMap::new();
     if !graph.assist_enabled() {
         return candidates;
     }
@@ -667,6 +658,16 @@ fn collect_splice_candidates(
                 continue;
             }
 
+            // All source PCs for edges from src_key to this target.
+            let src_pcs: Vec<u64> = graph
+                .dependents(src_key)
+                .filter(|e| {
+                    e.target.addr == target
+                        && matches!(e.kind, EdgeKind::Control | EdgeKind::Address)
+                })
+                .map(|e| e.source.pc)
+                .collect();
+
             for i in scan_start..corpus_count {
                 let entry = &corpus[i];
                 if entry.data.streams.get(&target).map_or(true, |s| s.bytes.is_empty()) {
@@ -681,8 +682,13 @@ fn collect_splice_candidates(
                         break;
                     }
                     let bytes = src_stream.bytes.clone();
-                    if !list.iter().any(|b| b == &bytes) {
-                        list.push(bytes);
+                    for &pc in &src_pcs {
+                        if list.len() >= MAX_DONORS_PER_STREAM {
+                            break;
+                        }
+                        if !list.iter().any(|(p, b)| *p == pc && *b == bytes) {
+                            list.push((pc, bytes.clone()));
+                        }
                     }
                 }
             }
@@ -701,8 +707,8 @@ fn collect_splice_candidates(
 fn collect_discriminants(
     graph: &StreamRelationGraph,
     streams: &[(StreamKey, usize)],
-) -> HashMap<StreamKey, Vec<u64>> {
-    let mut map: HashMap<StreamKey, Vec<u64>> = HashMap::new();
+) -> HashMap<StreamKey, Vec<(u64, u64)>> {
+    let mut map: HashMap<StreamKey, Vec<(u64, u64)>> = HashMap::new();
     if !graph.assist_enabled() {
         return map;
     }
@@ -711,14 +717,15 @@ fn collect_discriminants(
             if edge.kind != EdgeKind::Control || edge.value_set.is_empty() {
                 continue;
             }
+            let src_pc = edge.source.pc;
             let list = map.entry(key).or_default();
             // Sort by hit_count descending so highest-frequency discriminants
             // appear first; they are more likely to be the true gating values.
             let mut sorted = edge.value_set.clone();
             sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             for (v, _) in sorted {
-                if !list.contains(&v) {
-                    list.push(v);
+                if !list.iter().any(|&(p, val)| p == src_pc && val == v) {
+                    list.push((src_pc, v));
                 }
             }
         }
@@ -744,14 +751,14 @@ fn boundary_counts(current_len: usize) -> Vec<u64> {
     counts
 }
 
-/// Pick a byte offset for a directional write into `key`'s stream, drawn from the read
-/// slices the governing context(s) consumed.  Returns 0 when no slice is recorded.
+/// Pick a byte offset for a directional write into a stream, drawn from the read
+/// slices the specific source context consumed.  Returns 0 when no slice is recorded.
 fn pick_slice_start(
-    context_slices: &HashMap<StreamKey, Vec<(u32, u32)>>,
+    read_slices: &HashMap<ReadContext, Vec<(u32, u32)>>,
     rng: &mut impl Rng,
-    key: StreamKey,
+    ctx: ReadContext,
 ) -> usize {
-    match context_slices.get(&key).filter(|r| !r.is_empty()) {
+    match read_slices.get(&ctx).filter(|r| !r.is_empty()) {
         Some(ranges) => ranges[rng.gen_range(0..ranges.len())].0 as usize,
         None => 0,
     }
@@ -874,7 +881,8 @@ mod tests {
         );
         let list = &candidates[&a];
         assert!(!list.is_empty());
-        assert_eq!(list[0], a_bytes, "candidate must match A bytes from donor entry");
+        assert_eq!(list[0].0, 0x10, "source PC from edge");
+        assert_eq!(list[0].1, a_bytes, "candidate must match A bytes from donor entry");
     }
 
     /// When B is empty in all corpus entries, A must have no splice candidates.
@@ -930,8 +938,8 @@ mod tests {
 
         assert_eq!(
             map.get(&a).map(|v| v.as_slice()),
-            Some([3u64, 7u64].as_slice()),
-            "Control source surfaces its gating values regardless of target presence"
+            Some([(0x10u64, 3u64), (0x10u64, 7u64)].as_slice()),
+            "Control source surfaces its gating values with source PC"
         );
     }
 
@@ -995,7 +1003,7 @@ mod tests {
     // ── pick_slice_start ──────────────────────────────────────────────────────
 
     /// Directional writes target a recorded context slice offset, and fall back to 0
-    /// when the stream has no recorded slices.
+    /// when the context has no recorded slices.
     #[test]
     fn pick_slice_start_uses_recorded_ranges_else_zero() {
         use rand::SeedableRng;
@@ -1003,15 +1011,32 @@ mod tests {
 
         let a = 0x5800_0000u64;
         let b = 0x5800_0004u64;
-        let mut slices: HashMap<StreamKey, Vec<(u32, u32)>> = HashMap::new();
-        // `a` was read once starting at offset 8; `b` has no recorded slice.
-        slices.insert(a, vec![(8, 12)]);
+        let mut slices: HashMap<ReadContext, Vec<(u32, u32)>> = HashMap::new();
+        // Context (pc=0x100, a) was read once starting at offset 8.
+        slices.insert((0x100, a), vec![(8, 12)]);
 
-        assert_eq!(pick_slice_start(&slices, &mut rng, a), 8, "targets the recorded slice start");
-        assert_eq!(pick_slice_start(&slices, &mut rng, b), 0, "unknown stream falls back to 0");
+        assert_eq!(
+            pick_slice_start(&slices, &mut rng, (0x100, a)),
+            8,
+            "targets the recorded slice start for the exact context"
+        );
+        assert_eq!(
+            pick_slice_start(&slices, &mut rng, (0x200, a)),
+            0,
+            "different PC at same address falls back to 0"
+        );
+        assert_eq!(
+            pick_slice_start(&slices, &mut rng, (0x100, b)),
+            0,
+            "unknown stream falls back to 0"
+        );
 
-        // A stream whose only recorded range is empty also falls back to 0.
-        slices.insert(b, vec![]);
-        assert_eq!(pick_slice_start(&slices, &mut rng, b), 0, "empty range list falls back to 0");
+        // A context whose only recorded range is empty also falls back to 0.
+        slices.insert((0x100, b), vec![]);
+        assert_eq!(
+            pick_slice_start(&slices, &mut rng, (0x100, b)),
+            0,
+            "empty range list falls back to 0"
+        );
     }
 }
