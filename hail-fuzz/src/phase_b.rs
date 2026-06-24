@@ -1,7 +1,7 @@
 //! Phase B — dynamic taint pass for typed stream-relationship classification.
 //! Interprets cached P-code blocks against a `ShadowState` driven by live `Cpu` values.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -787,6 +787,10 @@ pub struct PhaseBState {
     blocks: HashMap<u64, CachedGroup>,
     engine: PhaseBEngine,
     mmio_ranges: Vec<Range<u64>>,
+    /// Fast-path armed flag checked OUTSIDE the RefCell borrow in the hot hook.
+    /// Lives inside PhaseBState but is read via `Rc<Cell<bool>>` by the hook closure
+    /// without borrowing the RefCell.  The `Cell<bool>` field here is the ground truth;
+    /// `armed_flag` (the Rc clone shared with the hook) points to the same Cell.
     armed: bool,
 }
 
@@ -866,7 +870,8 @@ impl icicle_vm::CodeInjector for PhaseBInjector {
 
 /// Install the Phase B block cache and hook into `vm`.
 /// Must be called before the blocks of interest are translated.
-pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBState>> {
+pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> (Rc<RefCell<PhaseBState>>, Rc<Cell<bool>>) {
+    let armed_flag = Rc::new(Cell::new(false));
     let state = Rc::new(RefCell::new(PhaseBState {
         blocks: HashMap::new(),
         engine: PhaseBEngine::new(HashMap::new(), mmio_ranges.clone()),
@@ -875,7 +880,12 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
     }));
 
     let hook_state = state.clone();
+    let hook_armed = armed_flag.clone();
     let hook = vm.cpu.add_hook(move |cpu: &mut Cpu, addr: u64| {
+        // Fast path: check the Cell<bool> BEFORE any RefCell borrow or catch_unwind.
+        // When disarmed (99%+ of executions), this is a single Cell::get() — essentially free.
+        if !hook_armed.get() { return; }
+
         let cpu_raw: *mut Cpu = cpu;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let cpu = unsafe { &mut *cpu_raw };
@@ -894,6 +904,7 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
                 "Phase B: hook panicked at {:#x}; disarming this pass",
                 addr
             );
+            hook_armed.set(false);
             if let Ok(mut st) = hook_state.try_borrow_mut() {
                 st.set_armed(false);
             }
@@ -901,7 +912,7 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> Rc<RefCell<PhaseBSt
     });
 
     vm.add_injector(PhaseBInjector { state: state.clone(), hook });
-    state
+    (state, armed_flag)
 }
 
 #[cfg(test)]

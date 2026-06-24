@@ -366,9 +366,17 @@ impl FuzzerStage for MultiStreamExtendStage {
             // Hybrid trigger: if this execution hit a frontier branch but did not
             // produce new coverage, trigger Phase B to discover dependencies that
             // may help unlock the uncovered successor.
+            //
+            // Throttled: at most once every HYBRID_COOLDOWN execs to prevent meltdown
+            // when coverage plateaus (nearly every exec would hit a frontier with no
+            // new coverage, and each Phase B pass is a full re-execution).
+            const HYBRID_COOLDOWN: u64 = 5000;
             if !do_phase_b && fuzzer.phase_b.is_some() && !fuzzer.state.new_coverage {
-                if fuzzer.check_frontier_hit() {
+                if fuzzer.execs >= fuzzer.phase_b_last_hybrid + HYBRID_COOLDOWN
+                    && fuzzer.check_frontier_hit()
+                {
                     do_phase_b = true;
+                    fuzzer.phase_b_last_hybrid = fuzzer.execs;
                 }
             }
 

@@ -131,6 +131,14 @@ impl StageData for HavocStage {
             splice_candidates.values().map(|v| v.len()).sum::<usize>(),
             frontier_boosts.iter().filter(|&&w| w > 1.5).count(),
         );
+        // Seed the slice ledger from the parent input's execution.  This gives
+        // directional writes a baseline without deep-cloning every fuzz_one.
+        let read_slices = fuzzer
+            .target
+            .get_mmio_handler(&mut fuzzer.vm)
+            .map(|h| h.source.read_slices.clone())
+            .unwrap_or_default();
+
         Ok(Self {
             attempts,
             streams,
@@ -143,7 +151,7 @@ impl StageData for HavocStage {
             length_rel,
             splice_candidates,
             discriminants,
-            read_slices: HashMap::new(),
+            read_slices,
             saved: false,
         })
     }
@@ -175,12 +183,6 @@ impl StageData for HavocStage {
 
         fuzzer.write_input_to_target().unwrap();
         let exit = fuzzer.execute()?;
-
-        // Copy the per-context slice ledger from the just-executed run so directional
-        // writes target the exact bytes each governing context reads.
-        if let Some(handler) = fuzzer.target.get_mmio_handler(&mut fuzzer.vm) {
-            self.read_slices.clone_from(&handler.source.read_slices);
-        }
 
         // Keep track of the streams that cause us to exit because they are too small.
         if let Some(key) = fuzzer.state.input.last_read {

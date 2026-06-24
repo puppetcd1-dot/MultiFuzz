@@ -559,10 +559,16 @@ pub(crate) struct Fuzzer {
     /// Phase B: dynamic taint state (block cache + engine), installed only when the
     /// `PHASE_B` env var is set.  `None` disables Phase B entirely.
     pub phase_b: Option<std::rc::Rc<std::cell::RefCell<phase_b::PhaseBState>>>,
+    /// Fast-path armed flag shared with the per-block hook closure.  Setting this
+    /// `Cell<bool>` gates the hook before any `RefCell` borrow or `catch_unwind`,
+    /// making the disarmed path essentially free (~1 ns per block).
+    pub phase_b_armed: std::rc::Rc<std::cell::Cell<bool>>,
     /// Cross-pass `(value_A, count_B)` samples used to fit `Length` edge relations.
     pub length_store: phase_b::LengthSampleStore,
     /// Counter used to sample which new-stream events trigger a Phase B taint pass.
     pub phase_b_counter: u64,
+    /// Execution counter at last Phase B hybrid trigger, used for cooldown.
+    pub phase_b_last_hybrid: u64,
     /// Coverage-directed mutation weights: maps each MMIO stream that gates an uncovered
     /// frontier branch to a boost factor (≥ 1.0).  Recomputed periodically from the true
     /// coverage frontier (see `maybe_recompute_frontier`); empty when assistance is disabled.
@@ -671,10 +677,10 @@ impl Fuzzer {
         // (after the boot run) so only blocks lifted during fuzzing are instrumented — the
         // small boot-path prefix is intentionally uninstrumented (it precedes the first MMIO
         // read, so it has no taint sources).
-        let phase_b = if env_enabled("PHASE_B") {
+        let (phase_b, phase_b_armed) = if env_enabled("PHASE_B") {
             let ranges = mmio_flow.mmio_ranges.clone();
             tracing::info!("PHASE_B enabled — installing dynamic taint instrumentation");
-            let pb_state = phase_b::install(&mut vm, ranges);
+            let (pb_state, armed_flag) = phase_b::install(&mut vm, ranges);
             for (env_var, summary) in [
                 ("PHASE_B_MEMCPY_ADDR",       phase_b::FuncSummary::Memcpy),
                 ("PHASE_B_MEMMOVE_ADDR",      phase_b::FuncSummary::Memmove),
@@ -689,9 +695,9 @@ impl Fuzzer {
                     }
                 }
             }
-            Some(pb_state)
+            (Some(pb_state), armed_flag)
         } else {
-            None
+            (None, std::rc::Rc::new(std::cell::Cell::new(false)))
         };
 
         let mut global_dict = Dictionary::default();
@@ -740,8 +746,10 @@ impl Fuzzer {
             relation_graph,
             mmio_flow,
             phase_b,
+            phase_b_armed,
             length_store: phase_b::LengthSampleStore::new(),
             phase_b_counter: 0,
+            phase_b_last_hybrid: 0,
             frontier_weights: HashMap::new(),
             frontier_block_count: 0,
             stagnation: HashMap::new(),
@@ -821,6 +829,7 @@ impl Fuzzer {
             st.reset_pass(read_sites, ranges);
             st.set_armed(true);
         }
+        self.phase_b_armed.set(true);
 
         Snapshot::restore_initial(self);
         self.state.input.seek_to_start();
@@ -828,6 +837,7 @@ impl Fuzzer {
             let _ = self.execute();
         }
 
+        self.phase_b_armed.set(false);
         let result = {
             let mut st = state.borrow_mut();
             st.set_armed(false);
