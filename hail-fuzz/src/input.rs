@@ -3,7 +3,10 @@ use std::io::Read;
 use anyhow::Context;
 use hashbrown::HashMap;
 
-use icicle_cortexm::{mmio::FuzzwareMmioHandler, CortexmTarget};
+use icicle_cortexm::{
+    mmio::{AccessContextSink, FuzzwareMmioHandler},
+    CortexmTarget,
+};
 use icicle_vm::cpu::mem::{IoMemory, MemError, MemResult};
 
 use crate::debugging::trace::IoTracerAny;
@@ -57,6 +60,11 @@ pub type StreamKey = u64;
 const VERSION: u8 = 1;
 const FILE_HEADER: [u8; 4] = [b'm', b'u', b'l', VERSION];
 
+/// A read context: the instruction PC performing an MMIO read and the address it read.
+/// Storage stays address-keyed (one continuous byte stream per address); contexts are a
+/// finer-grained view used by the dependency analysis and slice-targeted mutation.
+pub type ReadContext = (u64, StreamKey);
+
 /// Represents an input source where every MMIO access is read from a global input stream.
 #[derive(Default)]
 pub struct MultiStream {
@@ -64,6 +72,14 @@ pub struct MultiStream {
     pub streams: HashMap<StreamKey, StreamData>,
     pub last_read: Option<StreamKey>,
     pub tracer: Option<Box<dyn IoTracerAny>>,
+    /// Per-context byte slices read during the current execution: `(pc, addr)` → the
+    /// `[start, end)` cursor ranges that context consumed from its address stream.
+    /// Lets the mutator target the exact bytes a given access context reads instead of
+    /// always writing at offset 0.  Reset at the start of each execution; populated live
+    /// as reads occur (the PC is supplied by the MMIO handler via [`AccessContextSink`]).
+    pub read_slices: HashMap<ReadContext, Vec<(u32, u32)>>,
+    /// PC of the in-flight MMIO read, set by the handler immediately before each read.
+    pending_pc: Option<u64>,
 }
 
 impl std::fmt::Debug for MultiStream {
@@ -82,6 +98,8 @@ impl Clone for MultiStream {
             streams: self.streams.clone(),
             last_read: self.last_read,
             tracer: self.tracer.as_ref().map(|x| x.dyn_clone()),
+            read_slices: self.read_slices.clone(),
+            pending_pc: self.pending_pc,
         }
     }
 
@@ -100,28 +118,61 @@ impl Clone for MultiStream {
         }
 
         self.last_read = source.last_read;
+        // Inherit the source's context slices (empty for a freshly seeked input), which
+        // resets our ledger so the next execution captures a clean per-context mapping.
+        self.read_slices.clone_from(&source.read_slices);
+        self.pending_pc = source.pending_pc;
+    }
+}
+
+impl AccessContextSink for MultiStream {
+    fn note_read_pc(&mut self, pc: u64) {
+        self.pending_pc = Some(pc);
     }
 }
 
 impl MultiStream {
     pub fn new(streams: HashMap<StreamKey, StreamData>) -> Self {
-        Self { streams, last_read: None, tracer: None }
+        Self { streams, last_read: None, tracer: None, read_slices: HashMap::default(), pending_pc: None }
     }
 
     pub fn next_bytes(&mut self, addr: StreamKey, size: usize) -> Option<&[u8]> {
         self.last_read = Some(addr);
-        let stream = self.streams.get_mut(&addr)?;
-        let buf = stream.bytes.get(stream.cursor as usize..stream.cursor as usize + size)?;
-        if let Some(tracer) = self.tracer.as_mut() {
-            tracer.read(addr, buf);
+        let pending_pc = self.pending_pc;
+
+        // Advance the cursor, run the tracer, and record the read range.  The cursor
+        // start is captured before advancing so it can be attributed to the read context.
+        let start = {
+            let stream = self.streams.get_mut(&addr)?;
+            let start = stream.cursor as usize;
+            stream.bytes.get(start..start + size)?; // bounds check (returns None on underflow)
+            if let Some(tracer) = self.tracer.as_mut() {
+                tracer.read(addr, &stream.bytes[start..start + size]);
+            }
+            stream.sizes |= size as u32;
+            stream.cursor += size as u32;
+            start as u32
+        };
+
+        // Attribute the slice to its (pc, addr) context.  Ranges are deduplicated so that
+        // snapshot/restore replays of the same read do not double-record.
+        if let Some(pc) = pending_pc {
+            let range = (start, start + size as u32);
+            let ranges = self.read_slices.entry((pc, addr)).or_default();
+            if !ranges.contains(&range) {
+                ranges.push(range);
+            }
         }
-        stream.sizes |= size as u32;
-        stream.cursor += size as u32;
-        Some(buf)
+
+        // Re-borrow for the return value now that the slice has been recorded.
+        let stream = self.streams.get(&addr)?;
+        stream.bytes.get(start as usize..start as usize + size)
     }
 
     pub fn clear(&mut self) {
         self.streams.values_mut().for_each(|x| x.clear());
+        self.read_slices.clear();
+        self.pending_pc = None;
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -216,11 +267,21 @@ impl MultiStream {
             reader.read_exact(&mut buf).ok()?;
             streams.insert(addr, StreamData::new(buf));
         }
-        Some(MultiStream { streams, last_read: None, tracer: None })
+        Some(MultiStream {
+            streams,
+            last_read: None,
+            tracer: None,
+            read_slices: HashMap::default(),
+            pending_pc: None,
+        })
     }
 
     pub fn seek_to_start(&mut self) {
         self.streams.values_mut().for_each(|x| x.cursor = 0);
+        // A new execution run begins: discard the previous run's context slices so the
+        // ledger reflects only the upcoming run.
+        self.read_slices.clear();
+        self.pending_pc = None;
     }
 
     pub fn trim(&mut self) {
@@ -316,7 +377,13 @@ mod legacy {
             reader.read_exact(&mut buf).ok()?;
             streams.insert(addr as u64, super::StreamData::new(buf));
         }
-        Some(super::MultiStream { streams, last_read: None, tracer: None })
+        Some(super::MultiStream {
+            streams,
+            last_read: None,
+            tracer: None,
+            read_slices: Default::default(),
+            pending_pc: None,
+        })
     }
 }
 
@@ -350,5 +417,45 @@ impl IoMemory for MultiStream {
         if let Some(tracer) = self.tracer.as_mut() {
             tracer.restore(snapshot.tracer.as_ref().unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read attributes its `[start, end)` byte range to the `(pc, addr)` context the
+    /// handler announced, and consecutive reads accumulate sequential slices.
+    #[test]
+    fn read_slices_record_per_context_ranges() {
+        let mut ms = MultiStream::new(HashMap::from_iter([
+            (0x4000_0000u64, StreamData::new(vec![0u8; 16])),
+        ]));
+
+        // Context A (pc 0x100) reads 4 bytes, then context B (pc 0x200) reads 2 bytes.
+        ms.note_read_pc(0x100);
+        assert_eq!(ms.next_bytes(0x4000_0000, 4).map(|b| b.len()), Some(4));
+        ms.note_read_pc(0x200);
+        assert_eq!(ms.next_bytes(0x4000_0000, 2).map(|b| b.len()), Some(2));
+
+        assert_eq!(ms.read_slices.get(&(0x100, 0x4000_0000)), Some(&vec![(0u32, 4u32)]));
+        assert_eq!(ms.read_slices.get(&(0x200, 0x4000_0000)), Some(&vec![(4u32, 6u32)]));
+
+        // Replaying the same read (after rewinding) must not double-record the range.
+        ms.seek_to_start();
+        assert!(ms.read_slices.is_empty(), "seek_to_start resets the ledger");
+        ms.note_read_pc(0x100);
+        ms.next_bytes(0x4000_0000, 4);
+        ms.note_read_pc(0x100);
+        // Re-record the same range via a redundant note (simulating a snapshot replay).
+        let stream = ms.streams.get_mut(&0x4000_0000).unwrap();
+        stream.cursor = 0;
+        ms.note_read_pc(0x100);
+        ms.next_bytes(0x4000_0000, 4);
+        assert_eq!(
+            ms.read_slices.get(&(0x100, 0x4000_0000)),
+            Some(&vec![(0u32, 4u32)]),
+            "identical replayed ranges are deduplicated"
+        );
     }
 }

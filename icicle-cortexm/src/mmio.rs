@@ -50,6 +50,14 @@ fn build_models(models: &config::MmioModels) -> (Vec<Model>, Vec<u32>) {
 }
 
 /// A re-implemented fuzzware MMIO handler
+/// Hook letting the MMIO handler inform the underlying stream source of the instruction
+/// PC performing each read, so the source can attribute reads to `(pc, addr)` contexts
+/// (e.g. recording per-context byte slices within a shared address stream).  Defaults to
+/// a no-op so sources that do not track contexts need no special handling.
+pub trait AccessContextSink {
+    fn note_read_pc(&mut self, _pc: u64) {}
+}
+
 pub struct FuzzwareMmioHandler<I> {
     pub source: I,
     pub models: Vec<Model>,
@@ -124,7 +132,7 @@ fn copy_u32(dst: &mut [u8], src: u32) {
     }
 }
 
-impl<I: IoMemory> IoMemory for FuzzwareMmioHandler<I> {
+impl<I: IoMemory + AccessContextSink> IoMemory for FuzzwareMmioHandler<I> {
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> MemResult<()> {
         unsafe { fuzzware::reload_fuzz_consumption_timer(self.uc_ptr) };
 
@@ -133,6 +141,10 @@ impl<I: IoMemory> IoMemory for FuzzwareMmioHandler<I> {
             let vm = &mut *ctx.vm;
             vm.cpu.read_pc() as u32
         };
+
+        // Tell the source which PC is performing this read so it can attribute the bytes
+        // to the (pc, addr) access context.
+        self.source.note_read_pc(pc as u64);
 
         let key = if self.access_contexts { ((pc as u64) << 32) | addr } else { addr };
 
@@ -244,6 +256,8 @@ impl GlobalMmioSource {
         self.offset = offset;
     }
 }
+
+impl AccessContextSink for GlobalMmioSource {}
 
 impl IoMemory for GlobalMmioSource {
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> MemResult<()> {

@@ -22,7 +22,7 @@ use icicle_vm::{
 
 use crate::{
     fuzzware::uc_engine,
-    mmio::FuzzwareMmioHandler,
+    mmio::{AccessContextSink, FuzzwareMmioHandler},
     unicorn_api::{Context, map_uc_err},
 };
 pub use unicorn_api::{IRQ_NUMBER_ADDR, TIMER_CHOICE_ADDR};
@@ -67,7 +67,7 @@ impl<T> CortexmTarget<T> {
     }
 }
 
-impl<I: IoMemory + 'static> CortexmTarget<FuzzwareMmioHandler<I>> {
+impl<I: IoMemory + AccessContextSink + 'static> CortexmTarget<FuzzwareMmioHandler<I>> {
     pub fn fuzzware_init(
         &mut self,
         config: &config::FirmwareConfig,
