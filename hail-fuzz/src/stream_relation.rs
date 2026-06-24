@@ -20,7 +20,7 @@ impl AccessContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     /// Value of source stream was used to compute the MMIO address of target.
     Address,
@@ -145,12 +145,6 @@ pub struct StreamRelationGraph {
     pub edges:    Vec<StreamEdge>,
     outgoing: HashMap<StreamKey, Vec<usize>>,
     incoming: HashMap<StreamKey, Vec<usize>>,
-    /// For each representative context that absorbed equivalent siblings during
-    /// [`merge_equivalent_contexts`], the set of member PCs (including its own).  A
-    /// context absent from this map represents only itself.  The mutator uses these
-    /// PCs to locate every member context's byte slice within the shared address
-    /// stream.
-    node_members: HashMap<AccessContext, Vec<u64>>,
     assist_enabled: bool,
 }
 
@@ -166,17 +160,14 @@ impl StreamRelationGraph {
     ///
     /// Edges are **context-granular**: the node identity is the full `AccessContext`
     /// `(pc, addr)`, so two reads of the same MMIO address from different instruction
-    /// PCs are distinct nodes with their own edge sets.  This preserves the dependency
-    /// context that an address-only merge would otherwise collapse.
+    /// PCs are distinct nodes with their own edge sets — and stay distinct for the
+    /// lifetime of the graph.  This preserves the dependency context that an
+    /// address-only merge would otherwise collapse.
     ///
     /// - If an edge with the same `(source, target)` context exists: upgrade kind if
     ///   higher priority (Address > Length > Control), merge relation (keep existing if
     ///   new is None; update if new is Some), don't downgrade kind.
     /// - Otherwise: create a new edge and index it.
-    ///
-    /// Redundant context nodes (same address, identical edge sets) are folded back
-    /// together out-of-band by [`merge_equivalent_contexts`], which bounds graph growth
-    /// without losing the per-context distinction where it matters.
     pub fn insert_or_confirm_edge(
         &mut self,
         source: AccessContext,
@@ -259,121 +250,6 @@ impl StreamRelationGraph {
                 }
             }
         }
-    }
-
-    /// Member PCs of a representative context: every instruction PC whose context was
-    /// folded into `ctx` by [`merge_equivalent_contexts`].  Returns a single-element
-    /// view (`ctx.pc`) for a context that represents only itself.
-    #[cfg(test)]
-    pub fn context_member_pcs(&self, ctx: AccessContext) -> Vec<u64> {
-        match self.node_members.get(&ctx) {
-            Some(pcs) => pcs.clone(),
-            None => vec![ctx.pc],
-        }
-    }
-
-    /// Fold redundant context nodes back together to bound graph growth.
-    ///
-    /// Two contexts at the same MMIO address whose edge signatures are identical —
-    /// the same set of `(direction, neighbour address, kind)` edges — encode the same
-    /// dependency behaviour and differ only in the instruction PC that performed the
-    /// read.  Such contexts are merged into a single representative (lowest PC); the
-    /// absorbed PCs are retained in `node_members` so the mutator can still target
-    /// every member context's byte slice.  Neighbours are projected to their address
-    /// for the signature because the mutation engine already operates at address
-    /// granularity on the partner side.
-    ///
-    /// Returns the number of contexts absorbed (0 if nothing was merged).
-    pub fn merge_equivalent_contexts(&mut self) -> usize {
-        // 1. Edge signature per context: sorted, deduplicated (dir, neighbour.addr, kind).
-        let mut sigs: HashMap<AccessContext, Vec<(bool, StreamKey, EdgeKind)>> = HashMap::new();
-        for e in &self.edges {
-            sigs.entry(e.source).or_default().push((true, e.target.addr, e.kind));
-            sigs.entry(e.target).or_default().push((false, e.source.addr, e.kind));
-        }
-        for v in sigs.values_mut() {
-            v.sort_unstable();
-            v.dedup();
-        }
-
-        // 2. Group contexts by (addr, signature); representative = lowest PC.
-        let mut groups: HashMap<(StreamKey, Vec<(bool, StreamKey, EdgeKind)>), Vec<AccessContext>> =
-            HashMap::new();
-        for (&c, s) in &sigs {
-            groups.entry((c.addr, s.clone())).or_default().push(c);
-        }
-
-        let mut canon: HashMap<AccessContext, AccessContext> = HashMap::new();
-        let mut new_members: HashMap<AccessContext, Vec<u64>> = HashMap::new();
-        let mut absorbed = 0usize;
-        for (_, mut members) in groups {
-            members.sort_unstable_by_key(|c| c.pc);
-            let rep = members[0];
-            let mut pcs: Vec<u64> = Vec::new();
-            for c in &members {
-                canon.insert(*c, rep);
-                match self.node_members.get(c) {
-                    Some(existing) => pcs.extend(existing.iter().copied()),
-                    None => pcs.push(c.pc),
-                }
-            }
-            absorbed += members.len() - 1;
-            if pcs.len() > 1 {
-                pcs.sort_unstable();
-                pcs.dedup();
-                new_members.insert(rep, pcs);
-            }
-        }
-
-        if absorbed == 0 {
-            // Preserve any pre-existing membership; nothing structural changed.
-            return 0;
-        }
-
-        // 3. Rewrite edges with canonical endpoints, deduplicating and merging fields.
-        let old = std::mem::take(&mut self.edges);
-        self.outgoing.clear();
-        self.incoming.clear();
-        for mut e in old {
-            e.source = canon.get(&e.source).copied().unwrap_or(e.source);
-            e.target = canon.get(&e.target).copied().unwrap_or(e.target);
-
-            // Merge into an existing canonical edge if one already exists.
-            let existing = self
-                .incoming
-                .get(&e.target.addr)
-                .and_then(|idxs| {
-                    idxs.iter().copied().find(|&i| {
-                        self.edges[i].source == e.source && self.edges[i].target == e.target
-                    })
-                });
-            if let Some(idx) = existing {
-                let dst = &mut self.edges[idx];
-                // Take the higher-priority kind, preferring a present relation.
-                if e.kind.priority() > dst.kind.priority() {
-                    dst.kind = e.kind;
-                    dst.relation = e.relation.take();
-                } else if dst.relation.is_none() {
-                    dst.relation = e.relation.take();
-                }
-                // Union the discriminant sets (summing hit counts on collisions).
-                for (v, c) in e.value_set.drain(..) {
-                    match dst.value_set.iter_mut().find(|(ev, _)| *ev == v) {
-                        Some(entry) => entry.1 = entry.1.saturating_add(c),
-                        None => dst.value_set.push((v, c)),
-                    }
-                }
-                continue;
-            }
-
-            let idx = self.edges.len();
-            self.outgoing.entry(e.source.addr).or_default().push(idx);
-            self.incoming.entry(e.target.addr).or_default().push(idx);
-            self.edges.push(e);
-        }
-
-        self.node_members = new_members;
-        absorbed
     }
 
     #[cfg(test)]
@@ -769,43 +645,26 @@ mod tests {
         assert_eq!(govs[0], (a_addr, EdgeKind::Address));
     }
 
-    /// `merge_equivalent_contexts` folds same-address contexts with identical edge
-    /// signatures into one representative (lowest PC) and retains the member PCs,
-    /// while leaving contexts with differing signatures distinct.
+    /// Context independence is permanent: same-address contexts with identical edge
+    /// signatures are never folded together — each `(pc, addr)` read keeps its own
+    /// edges for the lifetime of the graph.
     #[test]
-    fn merge_equivalent_contexts_folds_identical_signatures() {
+    fn equivalent_contexts_are_never_merged() {
         let mut g = StreamRelationGraph::new();
         let a: StreamKey = 0x4001_0000;
         let b: StreamKey = 0x4001_0004;
-        let c: StreamKey = 0x4001_0008;
 
         // Two source contexts at `a` with the SAME signature (→ b Control).
         g.insert_or_confirm_edge(ctx(0x100, a), ctx(0x200, b), EdgeKind::Control, None);
         g.insert_or_confirm_edge(ctx(0x300, a), ctx(0x208, b), EdgeKind::Control, None);
-        // A third source context at `a` with a DIFFERENT signature (→ c Control).
-        g.insert_or_confirm_edge(ctx(0x500, a), ctx(0x600, c), EdgeKind::Control, None);
-        // Record a discriminant on the first edge so the union is exercised.
-        g.record_discriminant(a, b, 0x42);
 
-        assert_eq!(g.edge_count(), 3, "three distinct context edges before merge");
+        // Both contexts persist as distinct edges — no folding occurs.
+        assert_eq!(g.edge_count(), 2, "identical-signature contexts stay distinct");
 
-        // Both the two source contexts at `a` and the two target contexts at `b`
-        // share signatures, so two contexts are absorbed in total.
-        let absorbed = g.merge_equivalent_contexts();
-        assert_eq!(absorbed, 2, "redundant source and target contexts both absorbed");
-        assert_eq!(g.edge_count(), 2, "the two identical-signature edges collapse to one");
-
-        // Representative is the lowest PC (0x100) and retains both member PCs.
-        let members = g.context_member_pcs(ctx(0x100, a));
-        assert_eq!(members, vec![0x100, 0x300], "member PCs retained on the representative");
-
-        // The discriminant survives the merge.
+        // Address-level aggregation still presents a single deduplicated governor for
+        // the mutation engine, without collapsing the underlying context nodes.
         let govs_b = g.get_governors_by_addr(b);
         assert_eq!(govs_b, vec![(a, EdgeKind::Control)]);
-
-        // The differing-signature context to `c` is untouched.
-        assert_eq!(g.get_governors_by_addr(c), vec![(a, EdgeKind::Control)]);
-        assert_eq!(g.context_member_pcs(ctx(0x500, a)), vec![0x500], "unmerged context represents itself");
     }
 
     /// `get_governors_by_addr` returns deduplicated (source_addr, kind) pairs
