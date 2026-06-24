@@ -264,6 +264,7 @@ impl StreamRelationGraph {
     /// Member PCs of a representative context: every instruction PC whose context was
     /// folded into `ctx` by [`merge_equivalent_contexts`].  Returns a single-element
     /// view (`ctx.pc`) for a context that represents only itself.
+    #[cfg(test)]
     pub fn context_member_pcs(&self, ctx: AccessContext) -> Vec<u64> {
         match self.node_members.get(&ctx) {
             Some(pcs) => pcs.clone(),

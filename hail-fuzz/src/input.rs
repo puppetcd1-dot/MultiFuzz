@@ -78,6 +78,9 @@ pub struct MultiStream {
     /// always writing at offset 0.  Reset at the start of each execution; populated live
     /// as reads occur (the PC is supplied by the MMIO handler via [`AccessContextSink`]).
     pub read_slices: HashMap<ReadContext, Vec<(u32, u32)>>,
+    /// The `(pc, addr)` context of the most recent MMIO read, used to attribute
+    /// stagnation (executions since last new coverage) at context granularity.
+    pub last_read_context: Option<ReadContext>,
     /// PC of the in-flight MMIO read, set by the handler immediately before each read.
     pending_pc: Option<u64>,
 }
@@ -99,6 +102,7 @@ impl Clone for MultiStream {
             last_read: self.last_read,
             tracer: self.tracer.as_ref().map(|x| x.dyn_clone()),
             read_slices: self.read_slices.clone(),
+            last_read_context: self.last_read_context,
             pending_pc: self.pending_pc,
         }
     }
@@ -121,6 +125,7 @@ impl Clone for MultiStream {
         // Inherit the source's context slices (empty for a freshly seeked input), which
         // resets our ledger so the next execution captures a clean per-context mapping.
         self.read_slices.clone_from(&source.read_slices);
+        self.last_read_context = source.last_read_context;
         self.pending_pc = source.pending_pc;
     }
 }
@@ -133,7 +138,14 @@ impl AccessContextSink for MultiStream {
 
 impl MultiStream {
     pub fn new(streams: HashMap<StreamKey, StreamData>) -> Self {
-        Self { streams, last_read: None, tracer: None, read_slices: HashMap::default(), pending_pc: None }
+        Self {
+            streams,
+            last_read: None,
+            tracer: None,
+            read_slices: HashMap::default(),
+            last_read_context: None,
+            pending_pc: None,
+        }
     }
 
     pub fn next_bytes(&mut self, addr: StreamKey, size: usize) -> Option<&[u8]> {
@@ -157,6 +169,7 @@ impl MultiStream {
         // Attribute the slice to its (pc, addr) context.  Ranges are deduplicated so that
         // snapshot/restore replays of the same read do not double-record.
         if let Some(pc) = pending_pc {
+            self.last_read_context = Some((pc, addr));
             let range = (start, start + size as u32);
             let ranges = self.read_slices.entry((pc, addr)).or_default();
             if !ranges.contains(&range) {
@@ -172,6 +185,7 @@ impl MultiStream {
     pub fn clear(&mut self) {
         self.streams.values_mut().for_each(|x| x.clear());
         self.read_slices.clear();
+        self.last_read_context = None;
         self.pending_pc = None;
     }
 
@@ -272,6 +286,7 @@ impl MultiStream {
             last_read: None,
             tracer: None,
             read_slices: HashMap::default(),
+            last_read_context: None,
             pending_pc: None,
         })
     }
@@ -281,6 +296,7 @@ impl MultiStream {
         // A new execution run begins: discard the previous run's context slices so the
         // ledger reflects only the upcoming run.
         self.read_slices.clear();
+        self.last_read_context = None;
         self.pending_pc = None;
     }
 
@@ -382,6 +398,7 @@ mod legacy {
             last_read: None,
             tracer: None,
             read_slices: Default::default(),
+            last_read_context: None,
             pending_pc: None,
         })
     }

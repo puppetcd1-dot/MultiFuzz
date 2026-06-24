@@ -8,7 +8,7 @@ use icicle_vm::{
 use pcode::{Op, Value, VarId};
 
 use crate::{
-    input::StreamKey,
+    input::{ReadContext, StreamKey},
     stream_relation::AccessContext,
 };
 
@@ -442,10 +442,21 @@ pub fn compute_frontier_branch_set(code: &BlockTable) -> HashSet<u64> {
 pub fn compute_frontier_stream_weights(
     code: &BlockTable,
     mmio_flow: &MmioFlowAnalyzer,
-    stagnation: &HashMap<StreamKey, u32>,
+    stagnation: &HashMap<ReadContext, u32>,
 ) -> HashMap<StreamKey, f64> {
     let reached: HashSet<u64> = code.blocks.iter().map(|b| b.start).collect();
     let reverse_cfg = build_reverse_cfg(code);
+
+    // Aggregate per-context stagnation down to a per-address penalty using the *least*
+    // stagnant context: if any read site of an address is still finding new coverage, the
+    // address stays attractive even when its other contexts have gone stale.
+    let mut min_stag: HashMap<StreamKey, u32> = HashMap::new();
+    for (&(_pc, addr), &stag) in stagnation {
+        min_stag
+            .entry(addr)
+            .and_modify(|m| *m = (*m).min(stag))
+            .or_insert(stag);
+    }
 
     // Count how many times each block appears as a predecessor target (for rarity).
     let mut pred_count: HashMap<u64, u32> = HashMap::new();
@@ -481,7 +492,7 @@ pub fn compute_frontier_stream_weights(
 
     accum.into_iter()
         .map(|(k, raw)| {
-            let stag = stagnation.get(&k).copied().unwrap_or(0);
+            let stag = min_stag.get(&k).copied().unwrap_or(0);
             let penalty = STAGNATION_DECAY.powf(stag as f64);
             (k, 1.0 + raw * penalty)
         })
@@ -948,9 +959,9 @@ mod tests {
         let w_none = compute_frontier_stream_weights(&code, &analyzer, &HashMap::new());
         let weight_fresh = w_none.get(&stream).copied().unwrap_or(1.0);
 
-        // High stagnation: reduced weight.
+        // High stagnation: reduced weight.  Keyed by the read context (pc 0x700, stream).
         let mut stag = HashMap::new();
-        stag.insert(stream, 10u32);
+        stag.insert((0x700u64, stream), 10u32);
         // Need fresh blocks because block_table consumed the originals.
         let branch2 = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
         let mut fall2_pcode = pcode::Block::new();
@@ -973,6 +984,51 @@ mod tests {
         );
     }
 
+    /// Per-context stagnation aggregates to a per-address penalty by the *minimum*: a
+    /// single fresh read context keeps the whole address attractive even when a sibling
+    /// context at the same address has gone stale.
+    #[test]
+    fn stagnation_aggregates_by_min_across_contexts() {
+        let stream = 0x5800_0010u64;
+
+        // Build a fresh frontier code table (block_table consumes its blocks each call).
+        let make_code = || {
+            let branch = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+            let mut fall_pcode = pcode::Block::new();
+            fall_pcode.push(marker(0x720));
+            fall_pcode.push((VarNode::new(2, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+            let mut fall = lifter_block(fall_pcode, 0x720, 0x724);
+            fall.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+            block_table(vec![branch, fall])
+        };
+        let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+        analyzer.record_read_site(0x700, stream);
+
+        // Two contexts at the same address: one stale (stag 12), one fresh (stag 0).
+        let mut mixed = HashMap::new();
+        mixed.insert((0x700u64, stream), 12u32);
+        mixed.insert((0x900u64, stream), 0u32);
+        let w_mixed = compute_frontier_stream_weights(&make_code(), &analyzer, &mixed)
+            .get(&stream)
+            .copied()
+            .unwrap_or(1.0);
+
+        // All contexts stale: the penalty applies in full.
+        let mut all_stale = HashMap::new();
+        all_stale.insert((0x700u64, stream), 12u32);
+        all_stale.insert((0x900u64, stream), 12u32);
+        let w_all_stale = compute_frontier_stream_weights(&make_code(), &analyzer, &all_stale)
+            .get(&stream)
+            .copied()
+            .unwrap_or(1.0);
+
+        assert!(
+            w_mixed > w_all_stale,
+            "a fresh sibling context must keep the address attractive: \
+             mixed={w_mixed}, all_stale={w_all_stale}"
+        );
+    }
+
     /// The stagnation penalty follows the *exponential* form `STAGNATION_DECAY^n`,
     /// not the old linear reciprocal `1/(1+n)`. We verify the geometric ratio:
     /// `(w(n) - 1) / (w(0) - 1) == STAGNATION_DECAY^n`.
@@ -991,7 +1047,7 @@ mod tests {
             let mut analyzer = MmioFlowAnalyzer::new(vec![]);
             analyzer.record_read_site(0x700, stream);
             let mut map = HashMap::new();
-            map.insert(stream, stag);
+            map.insert((0x700u64, stream), stag);
             compute_frontier_stream_weights(&code, &analyzer, &map)
                 .get(&stream)
                 .copied()

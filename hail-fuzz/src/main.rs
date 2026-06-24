@@ -45,7 +45,7 @@ use crate::{
     debugging::trace::{self, PathTracerRef},
     dictionary::{Dictionary, DictionaryRef, MultiStreamDict},
     extension::LengthExtData,
-    input::{CortexmMultiStream, MultiStream, StreamKey},
+    input::{CortexmMultiStream, MultiStream, ReadContext, StreamKey},
     load_resizer::LoadResizeInjector,
     mmio_flow::MmioFlowAnalyzer,
     monitor::{CrashLogger, Monitor},
@@ -570,9 +570,11 @@ pub(crate) struct Fuzzer {
     /// The number of lifted blocks at the last frontier recompute, used to throttle the
     /// (relatively expensive) frontier attribution to coverage-growth events.
     pub frontier_block_count: usize,
-    /// Per-stream stagnation counters: how many mutations since last new coverage from
-    /// this stream.  Used to penalise over-mutated streams in frontier weighting.
-    pub stagnation: HashMap<StreamKey, u32>,
+    /// Per-context stagnation counters: how many executions since last new coverage from
+    /// each `(pc, addr)` read context.  Computed at context granularity (distinct read
+    /// sites of the same address stagnate independently) and aggregated down to a
+    /// per-address penalty in frontier weighting.
+    pub stagnation: HashMap<ReadContext, u32>,
     /// Current frontier branch block addresses — conditional blocks with at least one
     /// uncovered successor.  Updated alongside frontier weights.
     pub frontier_branches: HashSet<u64>,
@@ -1050,14 +1052,15 @@ impl Fuzzer {
             if self.state.new_coverage {
                 metadata.finds += 1;
                 metadata.last_find = metadata.execs;
-                // New coverage resets stagnation for all streams in this input.
-                for &key in self.state.input.streams.keys() {
-                    self.stagnation.insert(key, 0);
+                // New coverage resets stagnation for every read context exercised by this
+                // input (the contexts recorded in the slice ledger during execution).
+                for &ctx in self.state.input.read_slices.keys() {
+                    self.stagnation.insert(ctx, 0);
                 }
             } else {
-                // No new coverage: increment stagnation for streams that were mutated.
-                if let Some(last_read) = self.state.input.last_read {
-                    *self.stagnation.entry(last_read).or_insert(0) += 1;
+                // No new coverage: increment stagnation for the context that read last.
+                if let Some(ctx) = self.state.input.last_read_context {
+                    *self.stagnation.entry(ctx).or_insert(0) += 1;
                 }
             }
         }
