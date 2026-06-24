@@ -5,11 +5,11 @@ use icicle_vm::{
     cpu::lifter::{Block, BlockExit, Target},
     BlockTable,
 };
-use pcode::{Op, Value, VarId, VarNode};
+use pcode::{Op, Value, VarId};
 
 use crate::{
     input::StreamKey,
-    stream_relation::{AccessContext, EdgeKind},
+    stream_relation::AccessContext,
 };
 
 const MAX_CALL_LEVELS: usize = 3;
@@ -46,14 +46,6 @@ pub struct DemandSlice {
 }
 
 impl DemandSlice {
-    pub fn seed(vn: pcode::VarNode) -> Self {
-        let mut s = Self::default();
-        if !vn.is_invalid() {
-            s.demanded_data.insert(vn.id);
-        }
-        s
-    }
-
     fn demand_count(&self) -> usize { self.demanded_data.len() + self.demanded_ctrl.len() }
     fn source_count(&self) -> usize { self.sources_addr.len() + self.sources_ctrl.len() }
 
@@ -215,18 +207,6 @@ impl DemandSlice {
         self.demanded_ctrl.retain(|id| *id >= 0);
     }
 
-    /// Collapse discovered sources into classified `(context, kind)` candidates.
-    /// Address provenance takes priority over Control when a context appears on both.
-    fn into_candidates(self) -> Vec<(AccessContext, EdgeKind)> {
-        let mut map: HashMap<AccessContext, EdgeKind> = HashMap::new();
-        for ctx in self.sources_addr {
-            map.insert(ctx, EdgeKind::Address);
-        }
-        for ctx in self.sources_ctrl {
-            map.entry(ctx).or_insert(EdgeKind::Control);
-        }
-        map.into_iter().collect()
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -315,66 +295,6 @@ impl MmioFlowAnalyzer {
 
     pub fn record_read_site(&mut self, pc: u64, addr: StreamKey) {
         self.mmio_read_sites.insert(pc, addr);
-    }
-
-    /// Return all MMIO contexts that structurally govern stream B at `readwatch_pc`.
-    pub fn candidates_for_new_stream(
-        &self,
-        readwatch_pc: u64,
-        code: &BlockTable,
-    ) -> Vec<(AccessContext, EdgeKind)> {
-        let Some(block) = find_block_containing(code, readwatch_pc) else {
-            return vec![];
-        };
-
-        let dbg = std::env::var_os("DUMP_FLOW").is_some();
-        if dbg {
-            eprintln!(
-                "\n[flow] ───── new stream @ readwatch_pc={:#x}  block [{:#x}..{:#x}) ─────",
-                readwatch_pc, block.start, block.end
-            );
-            let mut sites: Vec<(&u64, &StreamKey)> = self.mmio_read_sites.iter().collect();
-            sites.sort();
-            eprintln!("[flow] read_sites ({} entries):", sites.len());
-            for (pc, key) in sites {
-                eprintln!("[flow]    pc={:#x} -> stream={:#x}", pc, key);
-            }
-        }
-
-        let mut slice = seed_demand_from_block(block, readwatch_pc);
-        if dbg {
-            eprintln!(
-                "[flow] seed demanded_data={:?} demanded_ctrl={:?}",
-                slice.demanded_data, slice.demanded_ctrl
-            );
-        }
-
-        let reverse_cfg = build_reverse_cfg(code);
-
-        // Backward CFG traversal: intra-function (depth=0) + inter-function up to
-        let cfg = TraverseCfg {
-            start_cutoff: Some(readwatch_pc),
-            inject_start_control: false,
-            inject_pred_control: true,
-        };
-        self.backward_traverse(code, &reverse_cfg, block.start, &cfg, &mut slice, 0);
-
-        if dbg {
-            eprintln!("[flow] RAW sources_addr={:?}", slice.sources_addr);
-            eprintln!("[flow] RAW sources_ctrl={:?}", slice.sources_ctrl);
-        }
-
-        let candidates: Vec<(AccessContext, EdgeKind)> = slice
-            .into_candidates()
-            .into_iter()
-            .filter(|(ctx, _)| ctx.pc != readwatch_pc)
-            .collect();
-
-        if dbg {
-            eprintln!("[flow] RESULT after self-edge filter: {:?}", candidates);
-        }
-
-        candidates
     }
 
     fn backward_traverse(
@@ -568,87 +488,21 @@ pub fn compute_frontier_stream_weights(
         .collect()
 }
 
-/// Seed the demand slice from the LOAD at `pc`, resolving indexed-load temporaries
-/// (`LDR R0,[R4,#4]` → `$tmp = INT_ADD(R4,4); LOAD($tmp)`) back to the base register.
-fn seed_demand_from_block(block: &Block, pc: u64) -> DemandSlice {
-    let mut current_pc = block.start;
-    let mut target_idx: Option<usize> = None;
-
-    for (i, stmt) in block.pcode.instructions.iter().enumerate() {
-        if stmt.op == Op::InstructionMarker {
-            if let pcode::Value::Const(addr, _) = stmt.inputs.first() {
-                current_pc = addr;
-            }
-        }
-        if current_pc == pc {
-            if let Op::Load(_) = stmt.op {
-                target_idx = Some(i);
-                break;
-            }
-        }
-    }
-
-    let idx = match target_idx {
-        Some(i) => i,
-        None => return DemandSlice::default(),
-    };
-
-    let load_stmt = &block.pcode.instructions[idx];
-    let addr_var = match load_stmt.inputs.first() {
-        Value::Var(vn) if !vn.is_invalid() => vn,
-        _ => return DemandSlice::default(),
-    };
-
-    let final_var = resolve_temporary_in_block(block, idx, addr_var.id);
-    if final_var.is_invalid() { DemandSlice::default() } else { DemandSlice::seed(final_var) }
-}
-
-fn resolve_temporary_in_block(block: &Block, up_to_idx: usize, tmp_id: VarId) -> VarNode {
-    if tmp_id > 0 { return VarNode::new(tmp_id, 4); }
-    if tmp_id == 0 { return VarNode::NONE; }
-    for stmt in block.pcode.instructions[..up_to_idx].iter().rev() {
-        let out = stmt.output;
-        if out.is_invalid() || out.id != tmp_id {
-            continue;
-        }
-        return match stmt.op {
-            Op::Copy | Op::ZeroExtend | Op::SignExtend => {
-                match stmt.inputs.first() {
-                    Value::Var(src) if !src.is_invalid() => {
-                        resolve_temporary_in_block(block, up_to_idx, src.id)
-                    }
-                    _ => VarNode::NONE,
-                }
-            }
-            Op::IntAdd | Op::IntSub => {
-                let src0 = stmt.inputs.first();
-                let src1 = stmt.inputs.second();
-                for src in [src0, src1] {
-                    if let Value::Var(vn) = src {
-                        if vn.id > 0 {
-                            return vn;
-                        }
-                        if vn.id < 0 {
-                            let rec = resolve_temporary_in_block(block, up_to_idx, vn.id);
-                            if !rec.is_invalid() {
-                                return rec;
-                            }
-                        }
-                    }
-                }
-                VarNode::NONE
-            }
-            _ => VarNode::NONE,
-        };
-    }
-    VarNode::NONE
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use icicle_vm::cpu::lifter::{Block, BlockExit};
     use pcode::VarNode;
+
+    impl DemandSlice {
+        fn seed(vn: pcode::VarNode) -> Self {
+            let mut s = Self::default();
+            if !vn.is_invalid() {
+                s.demanded_data.insert(vn.id);
+            }
+            s
+        }
+    }
 
     /// Wrap a hand-built `pcode::Block` in a lifter `Block` spanning `[start, end)`.
     fn lifter_block(pcode: pcode::Block, start: u64, end: u64) -> Block {
@@ -745,11 +599,9 @@ mod tests {
     /// address input and output must NOT appear as a source of itself.  This mirrors the
     /// firmware pattern seen at 0x800a506 / 0x800a54e where `out_id == addr_input_id == 30`.
     ///
-    /// The `candidates_for_new_stream` filter removes such self-references by checking
-    /// `ctx.pc != readwatch_pc`.  At the `process_block_backward` level the load IS recorded
-    /// (correctly — the fix only suppresses the entry in the final candidate list), so this
-    /// unit test verifies only the DemandSlice half.  The end-to-end filter is covered by the
-    /// integration: if the source pc == readwatch_pc it is stripped in candidates_for_new_stream.
+    /// At the `process_block_backward` level the load IS recorded (correctly), so this
+    /// unit test verifies the DemandSlice half.  A caller that consumes sources is
+    /// responsible for stripping self-edges where source pc == readwatch_pc.
     #[test]
     fn self_referential_load_does_not_propagate_as_address_source() {
         // Simulate `LDR R5,[R5]` — register r5 (id=5) is both address and destination.
@@ -765,15 +617,15 @@ mod tests {
         let mut read_sites: HashMap<u64, StreamKey> = HashMap::new();
         read_sites.insert(0x400, 0x5800_0000); // this IS in read_sites
 
-        // Seed with r5 (simulates seed_demand_from_block picking the address input of the
-        // self-referential load). id=5 will also match the load's out.id=5.
+        // Seed with r5 (simulates picking the address input of the self-referential load).
+        // id=5 will also match the load's out.id=5.
         let mut slice = DemandSlice::seed(r5);
         slice.process_block_backward(&block, &[], &read_sites, false, None);
 
         // At the process_block_backward level the source IS recorded (that's correct
-        // behaviour — the slice has no notion of "self").  The self-edge exclusion happens
-        // in candidates_for_new_stream by checking ctx.pc != readwatch_pc.
-        // Here we verify the source ctx has pc=0x400, which equals the readwatch_pc=0x400:
+        // behaviour — the slice has no notion of "self").  The caller is responsible for
+        // stripping self-edges where source pc == readwatch_pc.
+        // Verify the source ctx has pc=0x400, which equals the readwatch_pc=0x400:
         let self_source = AccessContext::new(0x400, 0x5800_0000);
         if slice.sources_addr.contains(&self_source) {
             // Correct — the slice recorded it; the caller is responsible for removing it.
@@ -876,37 +728,6 @@ mod tests {
         );
     }
 
-    /// `seed_demand_from_block` must resolve through the temporary produced by `INT_ADD`
-    /// for an indexed load (`LDR R0,[R4,#4]`) and seed the base register (R4), not the
-    /// short-lived temporary.  Seeding the temporary would leave `demanded_data = {-n}`
-    /// which `strip_temporaries` erases before any predecessor block is visited.
-    #[test]
-    fn seed_resolves_indexed_load_temporary_to_base_register() {
-        let mut pcode = pcode::Block::new();
-        let tmp = VarNode::new(-1, 4); // $tmp produced by INT_ADD
-        let r4 = VarNode::new(4, 4);   // base register R4
-        let r0 = VarNode::new(1, 4);   // destination
-
-        // LDR R0,[R4,#4] lifts as: $tmp = INT_ADD(R4, 4); R0 = LOAD($tmp)
-        pcode.push(marker(0x500));
-        pcode.push((tmp, pcode::Op::IntAdd, r4, pcode::Value::Const(4, 4)));
-        pcode.push((r0, pcode::Op::Load(0), tmp));
-
-        let block = lifter_block(pcode, 0x500, 0x504);
-
-        let slice = seed_demand_from_block(&block, 0x500);
-
-        assert!(
-            slice.demanded_data.contains(&r4.id),
-            "seed should demand the base register R4 (id=4), got {:?}",
-            slice.demanded_data
-        );
-        assert!(
-            !slice.demanded_data.contains(&tmp.id),
-            "seed must not demand the short-lived temporary (id=-1)"
-        );
-    }
-
     /// When a predecessor block's branch condition is gated on an MMIO read, the
     /// backward pass must produce a `Control` edge to that stream.  This verifies the
     /// inject_control-before-pass fix: the branch condition must be in `demanded_ctrl`
@@ -984,7 +805,7 @@ mod tests {
     }
 
     /// `candidates_for_branch` must trace a frontier branch back to the MMIO stream
-    /// whose value computes its condition — the dual of `candidates_for_new_stream`.
+    /// whose value computes its condition.
     #[test]
     fn candidates_for_branch_traces_gating_mmio() {
         let stream = 0x5800_0010u64;

@@ -256,12 +256,6 @@ impl StreamRelationGraph {
         }
     }
 
-    pub fn has_edge(&self, source: AccessContext, target: AccessContext) -> bool {
-        self.incoming
-            .get(&target.addr)
-            .map_or(false, |v| v.iter().any(|&i| self.edges[i].source == source))
-    }
-
     pub fn governors(&self, target: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.incoming.get(&target).map(|v| v.as_slice()).unwrap_or(&[]);
         indices.iter().map(|&i| &self.edges[i])
@@ -270,6 +264,7 @@ impl StreamRelationGraph {
     /// Returns deduplicated `(source_addr, kind)` pairs for all edges targeting
     /// `target_addr`.  When multiple edges share the same `source_addr`, returns
     /// the highest priority kind (Address > Length > Control).
+    #[allow(dead_code)] // reserved API for address-based aggregation in havoc
     pub fn get_governors_by_addr(&self, target_addr: StreamKey) -> Vec<(StreamKey, EdgeKind)> {
         let mut best: HashMap<StreamKey, EdgeKind> = HashMap::new();
         let indices = self.incoming.get(&target_addr).map(|v| v.as_slice()).unwrap_or(&[]);
