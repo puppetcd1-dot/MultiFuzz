@@ -837,8 +837,11 @@ impl Fuzzer {
             &mut self.length_store,
             result,
         );
+        // Fold redundant context nodes (same address, identical edge signature) back
+        // together to bound graph growth now that nodes are context-granular.
+        let absorbed = self.relation_graph.merge_equivalent_contexts();
         tracing::debug!(
-            "Phase B pass complete: {} edges in graph",
+            "Phase B pass complete: {} edges in graph ({absorbed} contexts merged)",
             self.relation_graph.edge_count(),
         );
     }
