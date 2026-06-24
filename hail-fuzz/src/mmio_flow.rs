@@ -13,8 +13,17 @@ use crate::{
 };
 
 const MAX_CALL_LEVELS: usize = 3;
-const FRONTIER_BOOST: f64 = 3.0;
 const MAX_FRONTIER_BRANCHES: usize = 512;
+
+/// Per-step multiplicative decay applied to a stream's frontier weight as its
+/// stagnation counter grows: `penalty = STAGNATION_DECAY^stagnation_count`.
+///
+/// Exponential (geometric) decay is gentler and more tunable than the linear
+/// reciprocal `1/(1+n)`, whose first few steps are very steep (1 → 0.5 → 0.33 → 0.25).
+/// With `0.85` the penalty falls smoothly (0.85, 0.72, 0.61, …), so a stream that
+/// has stagnated for a handful of rounds is de-prioritised gradually rather than
+/// being almost zeroed out immediately. Lower the base for a faster drop-off.
+const STAGNATION_DECAY: f64 = 0.85;
 
 /// Knobs for a single backward CFG traversal.
 /// Data-seed mode: `inject_start_control=false`, `inject_pred_control=true`, cutoff=B's PC.
@@ -494,15 +503,22 @@ pub fn compute_frontier_branch_set(code: &BlockTable) -> HashSet<u64> {
 
 /// Compute per-stream mutation weight boosts from frontier branches.
 ///
-/// For each frontier branch (conditional exit with at least one uncovered successor):
-///   - `unlock_potential`: number of uncovered successor addresses (typically 1 or 2).
-///   - `rarity`: `1.0 / (predecessor_count + 1)` where `predecessor_count` is the number of
-///     blocks in the reverse CFG that list this branch block as a successor. Falls back to
-///     `1.0 / 2.0` when unknown.
+/// A *frontier branch* is a conditional exit with at least one uncovered successor
+/// (no lifted block at that target address). We can detect that a branch leads
+/// somewhere new, but not *how much* new code lies beyond it — the successor
+/// blocks have not been lifted yet, so any "uncovered block count" would be a
+/// guess. We therefore do not estimate an unlock magnitude; every frontier branch
+/// contributes purely on the basis of its `rarity`:
+///   - `rarity`: `1.0 / (predecessor_count + 1)` where `predecessor_count` is the
+///     number of blocks in the reverse CFG that list this branch block as a
+///     successor. Falls back to `1.0 / 2.0` when unknown. Rare branches (few
+///     predecessors) score higher, biasing toward seldom-reached frontiers.
 ///
-/// Each gating MMIO stream accumulates `unlock_potential * rarity` across all frontier branches
-/// it controls.  A stagnation penalty `1.0 / (1 + stagnation_count)` is then applied per stream.
-/// The final weight is capped at `1.0 + FRONTIER_BOOST`.
+/// Each gating MMIO stream accumulates `rarity` across all frontier branches it
+/// controls. A stagnation penalty `STAGNATION_DECAY^stagnation_count` (exponential
+/// decay) is then applied per stream. The boost is additive (`1.0 + penalized`)
+/// and is *not* clamped — a stream that gates many rare frontiers is allowed to
+/// accumulate a proportionally larger weight rather than being truncated.
 pub fn compute_frontier_stream_weights(
     code: &BlockTable,
     mmio_flow: &MmioFlowAnalyzer,
@@ -525,31 +541,29 @@ pub fn compute_frontier_stream_weights(
         if processed >= MAX_FRONTIER_BRANCHES { break; }
         if block.exit.cond().is_none() { continue; }
 
-        // Count uncovered successors (unlock_potential).
-        let unlock_potential: u32 = block.exit.targets()
-            .filter(|t| target_addr(t, code).map_or(false, |addr| !reached.contains(&addr)))
-            .count() as u32;
-        if unlock_potential == 0 { continue; }
+        // Frontier test: does this branch lead to at least one unlifted (uncovered)
+        // successor? We only need the boolean — the count of uncovered successors is
+        // not a meaningful magnitude (it cannot see past the unlifted edge).
+        let is_frontier = block.exit.targets()
+            .any(|t| target_addr(&t, code).map_or(false, |addr| !reached.contains(&addr)));
+        if !is_frontier { continue; }
 
         processed += 1;
 
         // Rarity: inverse of how many predecessors reference this block.
         let hit_count = pred_count.get(&block.start).copied().unwrap_or(1);
-        let rarity = 1.0 / (hit_count as f64 + 1.0);
-
-        let contribution = unlock_potential as f64 * rarity;
+        let contribution = 1.0 / (hit_count as f64 + 1.0);
 
         for key in mmio_flow.candidates_for_branch_with_cfg(block.start, code, &reverse_cfg) {
             *accum.entry(key).or_insert(0.0) += contribution;
         }
     }
 
-    let cap = 1.0 + FRONTIER_BOOST;
     accum.into_iter()
         .map(|(k, raw)| {
             let stag = stagnation.get(&k).copied().unwrap_or(0);
-            let penalized = raw * 1.0 / (1 + stag) as f64;
-            (k, (1.0 + penalized).min(cap))
+            let penalty = STAGNATION_DECAY.powi(stag as i32);
+            (k, 1.0 + raw * penalty)
         })
         .collect()
 }
@@ -1136,6 +1150,44 @@ mod tests {
             weight_stagnant >= 1.0,
             "stagnated weight must still be >= 1.0; got {weight_stagnant}"
         );
+    }
+
+    /// The stagnation penalty follows the *exponential* form `STAGNATION_DECAY^n`,
+    /// not the old linear reciprocal `1/(1+n)`. We verify the geometric ratio:
+    /// `(w(n) - 1) / (w(0) - 1) == STAGNATION_DECAY^n`.
+    #[test]
+    fn stagnation_penalty_is_exponential() {
+        let stream = 0x5800_0010u64;
+
+        let build = |stag: u32| {
+            let branch = mmio_branch_block(0x700, 0x70c, 0xDEAD, 0x720);
+            let mut fall_pcode = pcode::Block::new();
+            fall_pcode.push(marker(0x720));
+            fall_pcode.push((VarNode::new(2, 4), pcode::Op::Copy, pcode::Value::Const(0, 4)));
+            let mut fall = lifter_block(fall_pcode, 0x720, 0x724);
+            fall.exit = BlockExit::Jump { target: Target::External(pcode::Value::Const(0x900, 4)) };
+            let code = block_table(vec![branch, fall]);
+            let mut analyzer = MmioFlowAnalyzer::new(vec![]);
+            analyzer.record_read_site(0x700, stream);
+            let mut map = HashMap::new();
+            map.insert(stream, stag);
+            compute_frontier_stream_weights(&code, &analyzer, &map)
+                .get(&stream)
+                .copied()
+                .unwrap_or(1.0)
+        };
+
+        let base = build(0) - 1.0; // raw frontier contribution, before any decay
+        assert!(base > 0.0, "fresh stream must carry a positive boost; got {base}");
+
+        for n in [1u32, 2, 5] {
+            let ratio = (build(n) - 1.0) / base;
+            let expected = STAGNATION_DECAY.powi(n as i32);
+            assert!(
+                (ratio - expected).abs() < 1e-9,
+                "stagnation decay must be exponential at n={n}: ratio={ratio}, expected={expected}"
+            );
+        }
     }
 
     // ── Phase A trigger tests ────────────────────────────────────────────────
