@@ -256,6 +256,7 @@ impl StreamRelationGraph {
         }
     }
 
+    #[cfg(test)]
     pub fn governors(&self, target: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.incoming.get(&target).map(|v| v.as_slice()).unwrap_or(&[]);
         indices.iter().map(|&i| &self.edges[i])
@@ -264,7 +265,6 @@ impl StreamRelationGraph {
     /// Returns deduplicated `(source_addr, kind)` pairs for all edges targeting
     /// `target_addr`.  When multiple edges share the same `source_addr`, returns
     /// the highest priority kind (Address > Length > Control).
-    #[allow(dead_code)] // reserved API for address-based aggregation in havoc
     pub fn get_governors_by_addr(&self, target_addr: StreamKey) -> Vec<(StreamKey, EdgeKind)> {
         let mut best: HashMap<StreamKey, EdgeKind> = HashMap::new();
         let indices = self.incoming.get(&target_addr).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -281,6 +281,22 @@ impl StreamRelationGraph {
     pub fn dependents(&self, source: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.outgoing.get(&source).map(|v| v.as_slice()).unwrap_or(&[]);
         indices.iter().map(|&i| &self.edges[i])
+    }
+
+    /// Returns deduplicated `(target_addr, kind)` pairs for all edges originating
+    /// from `source_addr`.  When multiple edges share the same `target_addr`, returns
+    /// the highest priority kind (Address > Length > Control).
+    pub fn get_dependents_by_addr(&self, source_addr: StreamKey) -> Vec<(StreamKey, EdgeKind)> {
+        let mut best: HashMap<StreamKey, EdgeKind> = HashMap::new();
+        let indices = self.outgoing.get(&source_addr).map(|v| v.as_slice()).unwrap_or(&[]);
+        for &idx in indices {
+            let edge = &self.edges[idx];
+            let entry = best.entry(edge.target.addr).or_insert(edge.kind);
+            if edge.kind.priority() > entry.priority() {
+                *entry = edge.kind;
+            }
+        }
+        best.into_iter().collect()
     }
 
     pub fn confirmed_edges(&self) -> impl Iterator<Item = &StreamEdge> {

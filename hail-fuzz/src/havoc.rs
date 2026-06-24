@@ -542,6 +542,9 @@ impl HavocMutator {
 ///                      co-mutate when `k` is mutated;
 ///   * `length_rel[s]`— `(target, relation)` for each confirmed `Length` edge `s → target`
 ///                      used for length preservation and OVERFLOW-PROBE.
+///
+/// Uses address-level aggregation (`get_dependents_by_addr` / `get_governors_by_addr`)
+/// so multiple edges between the same address pair are deduplicated automatically.
 fn build_coupling(
     graph: &StreamRelationGraph,
     streams: &[(StreamKey, usize)],
@@ -554,20 +557,26 @@ fn build_coupling(
 
     let present: HashSet<StreamKey> = streams.iter().map(|(k, _)| *k).collect();
     for &(key, _) in streams {
-        for edge in graph.dependents(key) {
-            let target = edge.target.addr;
+        // Outgoing: key → target (already deduplicated by target address).
+        for (target, kind) in graph.get_dependents_by_addr(key) {
             if target == key || !present.contains(&target) {
                 continue;
             }
             coupled.entry(key).or_default().push(target);
-            if edge.kind == EdgeKind::Length {
-                if let Some(rel) = &edge.relation {
-                    length_rel.entry(key).or_default().push((target, rel.clone()));
+            if kind == EdgeKind::Length {
+                // Retrieve the fitted relation from the underlying edge.
+                for edge in graph.dependents(key) {
+                    if edge.target.addr == target && edge.kind == EdgeKind::Length {
+                        if let Some(rel) = &edge.relation {
+                            length_rel.entry(key).or_default().push((target, rel.clone()));
+                            break;
+                        }
+                    }
                 }
             }
         }
-        for edge in graph.governors(key) {
-            let source = edge.source.addr;
+        // Incoming: source → key (already deduplicated by source address).
+        for (source, _kind) in graph.get_governors_by_addr(key) {
             if source == key || !present.contains(&source) {
                 continue;
             }
@@ -590,6 +599,9 @@ fn build_coupling(
 /// splicing them into the current input's A-stream seeds the execution with a value
 /// that previously unlocked B, giving the fuzzer a structural starting point instead
 /// of random bytes.
+///
+/// Uses address-level aggregation (`get_dependents_by_addr`) so duplicate edges
+/// between the same address pair don't trigger redundant corpus scans.
 fn collect_splice_candidates(
     graph: &StreamRelationGraph,
     streams: &[(StreamKey, usize)],
@@ -607,28 +619,24 @@ fn collect_splice_candidates(
 
     let present: HashSet<StreamKey> = streams.iter().map(|(k, _)| *k).collect();
 
-    // Scan the most-recent entries first (they tend to cover more of the target).
     const MAX_SCAN: usize = 100;
     const MAX_DONORS_PER_STREAM: usize = 16;
     let scan_start = corpus_count.saturating_sub(MAX_SCAN);
 
     for &(src_key, _) in streams {
-        for edge in graph.dependents(src_key) {
-            if !matches!(edge.kind, EdgeKind::Control | EdgeKind::Address) {
+        for (target, kind) in graph.get_dependents_by_addr(src_key) {
+            if !matches!(kind, EdgeKind::Control | EdgeKind::Address) {
                 continue;
             }
-            let target = edge.target.addr;
             if !present.contains(&target) {
                 continue;
             }
 
             for i in scan_start..corpus_count {
                 let entry = &corpus[i];
-                // Only entries where target is non-empty (B was reached).
                 if entry.data.streams.get(&target).map_or(true, |s| s.bytes.is_empty()) {
                     continue;
                 }
-                // Take the source stream bytes from this entry as a donor.
                 if let Some(src_stream) = entry.data.streams.get(&src_key) {
                     if src_stream.bytes.is_empty() {
                         continue;
