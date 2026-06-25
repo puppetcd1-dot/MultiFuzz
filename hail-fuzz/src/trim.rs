@@ -63,7 +63,9 @@ impl FuzzerStage for TrimStage {
 
             // Check whether we still hit all the target bits, and we still exit in the same way.
             let current_bits = fuzzer.coverage.get_bits(&mut fuzzer.vm);
-            let diverges = CrashKind::from(exit).is_crash()
+            let crash_kind = CrashKind::from(exit);
+            let diverges = crash_kind.is_crash()
+                || crash_kind.is_hang()
                 || !bits_to_keep.iter().all(|bit| is_bit_set(current_bits, *bit));
             if diverges {
                 // Input no longer hits the target bits skip past this chunk and restore the input.
