@@ -130,10 +130,17 @@ struct CtrlObs {
 /// runs; a genuine in-loop read is typically <30 blocks from its controlling branch.
 const GATING_WINDOW: u64 = {
     match option_env!("GATING_WINDOW") {
-        Some(_) => 128, // placeholder; runtime override below
-        None => 128,
+        Some(_) => 64, // placeholder; runtime override below
+        None => 64,
     }
 };
+
+/// Step penalty applied when a CALL or RETURN exit is observed.  This inflates
+/// the effective block distance when control crosses function boundaries, causing
+/// gating entries from a different call scope to expire sooner.  Without this,
+/// `stmclk_init_sysclk` (RCC polling) → `gpio_init` spans fewer than the window
+/// in raw blocks because they're called sequentially from the same parent.
+const CALL_BOUNDARY_PENALTY: u64 = 16;
 
 /// Branch-visit threshold above which a gating branch is considered a spinloop
 /// (busy-wait).  Spinloop discriminants (the values that let the loop exit) are
@@ -692,6 +699,12 @@ impl PhaseBEngine {
                     }
                 }
             }
+        }
+
+        // Fix 4: inflate step counter on CALL/RETURN exits so gating entries
+        // from a different function scope expire faster.
+        if matches!(block.exit, BlockExit::Call { .. } | BlockExit::Return { .. }) {
+            self.step += CALL_BOUNDARY_PENALTY;
         }
     }
 
@@ -1844,5 +1857,139 @@ mod tests {
         let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
         assert!(edge.is_some(), "low-iteration branch must produce an edge");
         assert!(edge.unwrap().is_eq, "low-iteration IntEqual branch must set is_eq");
+    }
+
+    // ── Fix 4: call/return boundary penalty ────────────────────────────────
+
+    /// A gating branch inside a callee function (e.g. `stmclk_init_sysclk`)
+    /// must expire faster when the callee returns, so GPIO reads in a sibling
+    /// callee (e.g. `gpio_init`) are not falsely gated.
+    ///
+    /// The test sets a window large enough to span the raw block count between
+    /// branch and target, but the CALL+RETURN boundary penalties inflate the
+    /// effective distance past the window.
+    #[test]
+    fn call_boundary_penalty_kills_cross_function_false_positive() {
+        let mut e = engine();
+        // Window = 40: raw block distance is ~6 (3 in callee + 3 gap), but
+        // CALL + RETURN penalties add 2 × CALL_BOUNDARY_PENALTY = 32 → total ~38.
+        // With window=40 this barely passes; with window=32 the penalty alone
+        // (32) + 6 blocks = 38 > 32, so the entry expires.  We pick 32 to
+        // show the penalty matters.
+        e.gating_window = 32;
+
+        e.read_sites.insert(0x200, 0x4002_1000); // RCC_CR (source in callee)
+        e.read_sites.insert(0x800, 0x4800_0004); // GPIOA (target in sibling callee)
+
+        // Block 1: inside callee — tainted polling branch.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntEqual, reg(1), Value::Const(0x2000000, 4)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x200, 4)),
+            fallthrough: Target::External(Value::Const(0x250, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x4002_1000);
+        env.regs.insert(8, 0x4800_0004);
+
+        // 3 iterations of the polling loop.
+        for _ in 0..3 {
+            e.run_block(&b1, &mut env);
+        }
+
+        // Callee returns: block with RETURN exit.
+        let mut pr = pcode::Block::new();
+        pr.push(marker(0x250));
+        let br = lifter_block(pr, 0x250, 0x254, BlockExit::Return {
+            target: Value::Const(0x500, 4),
+        });
+        e.run_block(&br, &mut env);
+
+        // Parent: 2 blocks of gap before calling gpio_init.
+        for i in 0..2u64 {
+            let mut pg = pcode::Block::new();
+            pg.push(marker(0x500 + i * 4));
+            let bg = lifter_block(pg, 0x500 + i * 4, 0x504 + i * 4, BlockExit::invalid());
+            e.run_block(&bg, &mut env);
+        }
+
+        // CALL into gpio_init.
+        let mut pc = pcode::Block::new();
+        pc.push(marker(0x510));
+        let bc = lifter_block(pc, 0x510, 0x514, BlockExit::Call {
+            target: Value::Const(0x800, 4),
+            fallthrough: 0x514,
+        });
+        e.run_block(&bc, &mut env);
+
+        // Inside gpio_init: target reads.
+        for _ in 0..4 {
+            let mut p2 = pcode::Block::new();
+            p2.push(marker(0x800));
+            p2.push((reg(5), Op::Load(0), reg(8)));
+            let b2 = lifter_block(p2, 0x800, 0x804, BlockExit::invalid());
+            e.run_block(&b2, &mut env);
+        }
+
+        let result = e.finish_pass();
+        let src = AccessContext::new(0x200, 0x4002_1000);
+        let tgt = AccessContext::new(0x800, 0x4800_0004);
+        let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
+        assert!(
+            edge.is_none(),
+            "call boundary penalty must expire gating from callee to sibling callee, got {edge:?}"
+        );
+    }
+
+    /// Positive counterpart: a genuine gating branch in the SAME function (no
+    /// CALL/RETURN boundaries) is not affected by the penalty.
+    #[test]
+    fn call_boundary_penalty_preserves_same_function_gating() {
+        let mut e = engine();
+        e.gating_window = 32;
+
+        e.read_sites.insert(0x200, 0x5800_0008);
+        e.read_sites.insert(0x300, 0x5800_0000);
+
+        // Block 1: tainted branch.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntLess, reg(3), reg(1)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+        env.regs.insert(3, 0);
+
+        // 4 iterations: branch → body (no CALL/RETURN boundaries).
+        for _ in 0..4 {
+            e.run_block(&b1, &mut env);
+            let mut p2 = pcode::Block::new();
+            p2.push(marker(0x300));
+            p2.push((reg(5), Op::Load(0), reg(8)));
+            let b2 = lifter_block(p2, 0x300, 0x304, BlockExit::invalid());
+            e.run_block(&b2, &mut env);
+        }
+
+        let result = e.finish_pass();
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
+        assert!(edge.is_some(), "same-function gating must still produce an edge");
+        assert!(edge.unwrap().is_length, "same-function loop must be classified as Length");
     }
 }

@@ -567,8 +567,10 @@ pub(crate) struct Fuzzer {
     pub length_store: phase_b::LengthSampleStore,
     /// Counter used to sample which new-stream events trigger a Phase B taint pass.
     pub phase_b_counter: u64,
-    /// Execution counter at last Phase B hybrid trigger, used for cooldown.
-    pub phase_b_last_hybrid: u64,
+    /// Timestamp of the last Phase B hybrid trigger, used for time-based cooldown.
+    pub phase_b_last_hybrid: std::time::Instant,
+    /// Duration of the most recent Phase B pass, used for adaptive cooldown.
+    pub phase_b_last_duration: std::time::Duration,
     /// Coverage-directed mutation weights: maps each MMIO stream that gates an uncovered
     /// frontier branch to a boost factor (≥ 1.0).  Recomputed periodically from the true
     /// coverage frontier (see `maybe_recompute_frontier`); empty when assistance is disabled.
@@ -749,7 +751,8 @@ impl Fuzzer {
             phase_b_armed,
             length_store: phase_b::LengthSampleStore::new(),
             phase_b_counter: 0,
-            phase_b_last_hybrid: 0,
+            phase_b_last_hybrid: std::time::Instant::now(),
+            phase_b_last_duration: std::time::Duration::ZERO,
             frontier_weights: HashMap::new(),
             frontier_block_count: 0,
             stagnation: HashMap::new(),
@@ -822,6 +825,8 @@ impl Fuzzer {
             return;
         };
 
+        let pass_start = std::time::Instant::now();
+
         let read_sites = self.mmio_flow.mmio_read_sites.clone();
         let ranges = self.mmio_flow.mmio_ranges.clone();
         {
@@ -849,10 +854,12 @@ impl Fuzzer {
             &mut self.length_store,
             result,
         );
-        // Nodes stay context-granular throughout: each (pc, addr) read context keeps
-        // its own edge set so distinct reads of the same address never collapse.
+
+        let elapsed = pass_start.elapsed();
+        self.phase_b_last_duration = elapsed;
         tracing::debug!(
-            "Phase B pass complete: {} edges in graph",
+            "Phase B pass complete in {:.1}ms: {} edges in graph",
+            elapsed.as_secs_f64() * 1000.0,
             self.relation_graph.edge_count(),
         );
     }

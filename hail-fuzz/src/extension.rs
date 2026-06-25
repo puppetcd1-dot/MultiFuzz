@@ -367,16 +367,24 @@ impl FuzzerStage for MultiStreamExtendStage {
             // produce new coverage, trigger Phase B to discover dependencies that
             // may help unlock the uncovered successor.
             //
-            // Throttled: at most once every HYBRID_COOLDOWN execs to prevent meltdown
-            // when coverage plateaus (nearly every exec would hit a frontier with no
-            // new coverage, and each Phase B pass is a full re-execution).
-            const HYBRID_COOLDOWN: u64 = 5000;
+            // Time-based cooldown: wait at least `min_interval` since the last
+            // hybrid pass.  The minimum interval adapts to the actual Phase B pass
+            // duration — at least 10× the pass time, floored at 5 s and capped at
+            // 60 s.  This prevents meltdown when coverage plateaus: without it,
+            // the count-based cooldown fires every fraction of a second but each
+            // pass takes 10+ seconds, spending ~96% of time in Phase B.
             if !do_phase_b && fuzzer.phase_b.is_some() && !fuzzer.state.new_coverage {
-                if fuzzer.execs >= fuzzer.phase_b_last_hybrid + HYBRID_COOLDOWN
+                let min_interval = {
+                    let adaptive = fuzzer.phase_b_last_duration.mul_f64(10.0);
+                    let floor = std::time::Duration::from_secs(5);
+                    let cap = std::time::Duration::from_secs(60);
+                    adaptive.max(floor).min(cap)
+                };
+                if fuzzer.phase_b_last_hybrid.elapsed() >= min_interval
                     && fuzzer.check_frontier_hit()
                 {
                     do_phase_b = true;
-                    fuzzer.phase_b_last_hybrid = fuzzer.execs;
+                    fuzzer.phase_b_last_hybrid = std::time::Instant::now();
                 }
             }
 
