@@ -589,8 +589,12 @@ fn build_coupling(
             if target == key || !present.contains(&target) {
                 continue;
             }
-            coupled.entry(key).or_default().push(target);
             if kind == EdgeKind::Length {
+                // Fix 2: only act on Length edges with a fitted relation.
+                // Unfitted Length edges are overwhelmingly false positives
+                // (taint leaked through boot-time polling loops); coupling on
+                // them wastes mutation budget preserving non-existent invariants.
+                let mut has_fitted = false;
                 for edge in graph.dependents(key) {
                     if edge.target.addr == target && edge.kind == EdgeKind::Length {
                         if let Some(rel) = &edge.relation {
@@ -598,9 +602,15 @@ fn build_coupling(
                                 .entry(key)
                                 .or_default()
                                 .push((edge.source.pc, target, rel.clone()));
+                            has_fitted = true;
                         }
                     }
                 }
+                if has_fitted {
+                    coupled.entry(key).or_default().push(target);
+                }
+            } else {
+                coupled.entry(key).or_default().push(target);
             }
         }
         // Incoming: source → key (already deduplicated by source address).
@@ -1040,5 +1050,79 @@ mod tests {
             0,
             "empty range list falls back to 0"
         );
+    }
+
+    // ── Fix 2: unfitted Length edges excluded from coupling ──────────────────
+
+    /// A Length edge WITHOUT a fitted relation must NOT appear in the coupling
+    /// map or length_rel — it is overwhelmingly a false positive from taint
+    /// leaking through boot-time polling loops.
+    #[test]
+    fn unfitted_length_edge_excluded_from_coupling() {
+        let a = 0x5800_0000u64;
+        let b = 0x5800_0004u64;
+
+        let mut graph = StreamRelationGraph::new();
+        // Length edge with NO relation (unfitted).
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Length, None);
+
+        let streams = vec![(a, 4usize), (b, 4usize)];
+        let (coupled, length_rel) = build_coupling(&graph, &streams);
+
+        assert!(
+            coupled.get(&a).map_or(true, |v| !v.contains(&b)),
+            "unfitted Length edge must NOT couple A→B, got {:?}",
+            coupled.get(&a)
+        );
+        assert!(
+            length_rel.get(&a).map_or(true, |v| v.is_empty()),
+            "unfitted Length edge must NOT produce length_rel entries"
+        );
+    }
+
+    /// A Length edge WITH a fitted relation is still included in coupling.
+    #[test]
+    fn fitted_length_edge_included_in_coupling() {
+        let a = 0x5800_0000u64;
+        let b = 0x5800_0004u64;
+
+        let mut graph = StreamRelationGraph::new();
+        graph.insert_or_confirm_edge(
+            ac(0x10, a),
+            ac(0x20, b),
+            EdgeKind::Length,
+            Some(Relation { kind: RelKind::Identity }),
+        );
+
+        let streams = vec![(a, 4usize), (b, 4usize)];
+        let (coupled, length_rel) = build_coupling(&graph, &streams);
+
+        assert!(
+            coupled.get(&a).map_or(false, |v| v.contains(&b)),
+            "fitted Length edge must couple A→B"
+        );
+        assert!(
+            length_rel.get(&a).map_or(false, |v| !v.is_empty()),
+            "fitted Length edge must produce length_rel entries"
+        );
+    }
+
+    /// Control and Address edges are unaffected by the relation gate.
+    #[test]
+    fn control_and_address_edges_always_couple() {
+        let a = 0x5800_0000u64;
+        let b = 0x5800_0004u64;
+        let c = 0x5800_0008u64;
+
+        let mut graph = StreamRelationGraph::new();
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x20, b), EdgeKind::Control, None);
+        graph.insert_or_confirm_edge(ac(0x10, a), ac(0x30, c), EdgeKind::Address, None);
+
+        let streams = vec![(a, 4usize), (b, 4usize), (c, 4usize)];
+        let (coupled, _) = build_coupling(&graph, &streams);
+
+        let a_partners = coupled.get(&a).cloned().unwrap_or_default();
+        assert!(a_partners.contains(&b), "Control edge must couple A→B");
+        assert!(a_partners.contains(&c), "Address edge must couple A→C");
     }
 }

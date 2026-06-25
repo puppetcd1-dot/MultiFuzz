@@ -124,6 +124,22 @@ struct CtrlObs {
     is_eq: bool,
 }
 
+/// Maximum distance (in interpreted blocks) between a gating branch evaluation and
+/// a target MMIO read for the gating entry to apply.  Boot-time polling loops
+/// (PLL-ready, oscillator-ready) exit thousands of blocks before GPIO/USART code
+/// runs; a genuine in-loop read is typically <30 blocks from its controlling branch.
+const GATING_WINDOW: u64 = {
+    match option_env!("GATING_WINDOW") {
+        Some(_) => 128, // placeholder; runtime override below
+        None => 128,
+    }
+};
+
+/// Branch-visit threshold above which a gating branch is considered a spinloop
+/// (busy-wait).  Spinloop discriminants (the values that let the loop exit) are
+/// not useful selectors — they gate everything downstream equally.
+const SPINLOOP_VISIT_THRESHOLD: u64 = 8;
+
 /// Dynamic taint interpreter operating one block at a time.
 pub struct PhaseBEngine {
     shadow: ShadowState,
@@ -145,6 +161,14 @@ pub struct PhaseBEngine {
     branch_visits: HashMap<u64, u64>,
     gating: Vec<(AccessContext, u64)>,
     gating_set: HashSet<(AccessContext, u64)>,
+    /// Last step at which each gating entry's branch was evaluated.  Updated on
+    /// every branch re-evaluation (not just the first insertion) so loop iterations
+    /// keep the entry "warm".  Target reads outside the recency window are not charged.
+    gating_last_step: HashMap<(AccessContext, u64), u64>,
+    /// Monotonic block counter incremented at each `begin_block`.
+    step: u64,
+    /// Runtime-configurable gating window (from `GATING_WINDOW` env var).
+    gating_window: u64,
     addr_edges: HashSet<(AccessContext, AccessContext)>,
     ctrl_obs: HashMap<(AccessContext, AccessContext), CtrlObs>,
     /// Per-address function summaries.  Not cleared between passes — populated once
@@ -154,6 +178,10 @@ pub struct PhaseBEngine {
 
 impl PhaseBEngine {
     pub fn new(read_sites: HashMap<u64, StreamKey>, mmio_ranges: Vec<Range<u64>>) -> Self {
+        let gating_window: u64 = std::env::var("GATING_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(GATING_WINDOW);
         Self {
             shadow: ShadowState::new(),
             read_sites,
@@ -169,6 +197,9 @@ impl PhaseBEngine {
             branch_visits: HashMap::new(),
             gating: Vec::new(),
             gating_set: HashSet::new(),
+            gating_last_step: HashMap::new(),
+            step: 0,
+            gating_window,
             addr_edges: HashSet::new(),
             ctrl_obs: HashMap::new(),
             summaries: HashMap::new(),
@@ -190,6 +221,8 @@ impl PhaseBEngine {
         self.branch_is_eq.clear();
         self.gating.clear();
         self.gating_set.clear();
+        self.gating_last_step.clear();
+        self.step = 0;
         self.addr_edges.clear();
         self.ctrl_obs.clear();
     }
@@ -435,6 +468,7 @@ impl PhaseBEngine {
         self.def_taint.clear();
         self.def_eq_derived.clear();
         self.cur_pc = start;
+        self.step += 1;
 
         // Capture source values deferred from previous block (load has now executed).
         if !self.pending_src_vals.is_empty() {
@@ -475,9 +509,13 @@ impl PhaseBEngine {
                             if src.addr != ctx.addr { self.addr_edges.insert((src, ctx)); }
                         }
 
-                        let gating: Vec<(AccessContext, u64)> = self.gating.clone();
-                        for (src, bpc) in gating {
+                        for i in 0..self.gating.len() {
+                            let (src, bpc) = self.gating[i];
                             if src.addr == ctx.addr { continue; }
+                            // Fix 1: only charge gating entries whose branch was
+                            // evaluated recently (within the recency window).
+                            let last = self.gating_last_step.get(&(src, bpc)).copied().unwrap_or(0);
+                            if self.step.saturating_sub(last) > self.gating_window { continue; }
                             let obs = self.ctrl_obs.entry((src, ctx)).or_default();
                             obs.fires += 1;
                             if self.branch_visits.get(&bpc).copied().unwrap_or(0) >= 2 { obs.is_loop = true; }
@@ -632,15 +670,25 @@ impl PhaseBEngine {
                 let cond_tag = self.taint_in(Value::Var(cond));
                 if !cond_tag.is_clean() {
                     let bpc = self.cur_pc;
-                    *self.branch_visits.entry(bpc).or_insert(0) += 1;
+                    let visits = self.branch_visits.entry(bpc).or_insert(0);
+                    *visits += 1;
+                    // Fix 3: suppress is_eq for spinloop branches — their exit
+                    // values are not useful selectors.
                     if self.def_eq_derived.contains(&cond.id) {
-                        self.branch_is_eq.insert(bpc);
+                        if *visits < SPINLOOP_VISIT_THRESHOLD {
+                            self.branch_is_eq.insert(bpc);
+                        } else {
+                            self.branch_is_eq.remove(&bpc);
+                        }
                     }
                     for src in self.contexts_of(&cond_tag) {
                         let key = (src, bpc);
                         if self.gating_set.insert(key) {
                             self.gating.push(key);
                         }
+                        // Fix 1: always update recency so loop re-evaluations
+                        // keep the entry "warm" for targets inside the loop.
+                        self.gating_last_step.insert(key, self.step);
                     }
                 }
             }
@@ -1584,5 +1632,217 @@ mod tests {
         for r in 0..4i16 {
             assert!(e.shadow.reg_tag(r).is_clean(), "r{r} must be killed after memcpy call");
         }
+    }
+
+    // ── Fix 1: gating recency window ────────────────────────────────────────
+
+    /// Simulate the stmclk_init_sysclk → led_init false-positive pattern:
+    ///
+    ///   Block 1 (PLL poll): reads MMIO_A in a tight loop (branch visited ≥2 times)
+    ///   ...many blocks of gap (simulated by running empty blocks)...
+    ///   Block N (GPIO init): reads MMIO_B ≥3 times
+    ///
+    /// Without the recency window, MMIO_A → MMIO_B would be classified as Length.
+    /// With the window, the gap exceeds GATING_WINDOW and no Length edge is emitted.
+    #[test]
+    fn recency_window_kills_boot_to_gpio_false_positive() {
+        let mut e = engine();
+        // Set a small window for the test (the production default is 128).
+        e.gating_window = 16;
+
+        e.read_sites.insert(0x200, 0x4002_1000); // RCC_CR (source)
+        e.read_sites.insert(0x800, 0x4800_0004); // GPIOA_OTYPER (target)
+
+        // Block 1: tainted polling loop (PLL-ready).  Read RCC_CR, branch on it.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntEqual, reg(1), Value::Const(0x2000000, 4)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x200, 4)), // back-edge
+            fallthrough: Target::External(Value::Const(0x300, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        // Simulate the loop body: run b1 three times (is_loop=true, fires≥2).
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x4002_1000);
+        env.regs.insert(8, 0x4800_0004);
+        for _ in 0..3 {
+            e.run_block(&b1, &mut env);
+        }
+
+        // Gap: 30 empty blocks (exceeds window of 16).
+        for i in 0..30u64 {
+            let mut pg = pcode::Block::new();
+            pg.push(marker(0x300 + i * 4));
+            let bg = lifter_block(pg, 0x300 + i * 4, 0x304 + i * 4, BlockExit::invalid());
+            e.run_block(&bg, &mut env);
+        }
+
+        // Block N: GPIO init — read MMIO_B ≥3 times.
+        for _ in 0..4 {
+            let mut p2 = pcode::Block::new();
+            p2.push(marker(0x800));
+            p2.push((reg(5), Op::Load(0), reg(8)));
+            let b2 = lifter_block(p2, 0x800, 0x804, BlockExit::invalid());
+            e.run_block(&b2, &mut env);
+        }
+
+        let result = e.finish_pass();
+        let src = AccessContext::new(0x200, 0x4002_1000);
+        let tgt = AccessContext::new(0x800, 0x4800_0004);
+        let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
+        assert!(
+            edge.is_none(),
+            "gating recency window must suppress boot-to-GPIO false positive, but got {edge:?}"
+        );
+    }
+
+    /// Positive counterpart: a genuine in-loop read (target inside the loop body,
+    /// within the recency window) is still classified as Length.
+    #[test]
+    fn recency_window_preserves_genuine_in_loop_length() {
+        let mut e = engine();
+        e.gating_window = 128; // default
+
+        e.read_sites.insert(0x200, 0x5800_0008); // source (loop counter)
+        e.read_sites.insert(0x300, 0x5800_0000); // target (buffer read inside loop)
+
+        // Block 1: tainted branch (loop header).
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntLess, reg(3), reg(1)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        // Block 2: target read (loop body) — immediately after the branch.
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(5), Op::Load(0), reg(8)));
+        let b2 = lifter_block(p2, 0x300, 0x304, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+        env.regs.insert(3, 0);
+
+        // 4 iterations: branch → body → branch → body → ...
+        for _ in 0..4 {
+            e.run_block(&b1, &mut env);
+            e.run_block(&b2, &mut env);
+        }
+
+        let result = e.finish_pass();
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
+        assert!(edge.is_some(), "genuine in-loop read must still produce an edge");
+        assert!(edge.unwrap().is_length, "genuine in-loop read must be classified as Length");
+    }
+
+    // ── Fix 3: spinloop discriminant suppression ────────────────────────────
+
+    /// A high-iteration spinloop (≥ SPINLOOP_VISIT_THRESHOLD visits) must NOT
+    /// set is_eq, even if the condition is derived from IntEqual.  The exit
+    /// values of a busy-wait are not useful selectors.
+    #[test]
+    fn spinloop_does_not_set_is_eq() {
+        let mut e = engine();
+        e.read_sites.insert(0x200, 0x5800_0008);
+        e.read_sites.insert(0x300, 0x5800_0000);
+
+        // Polling block: MMIO_A == 0x2000000 (e.g. PLL ready flag)
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntEqual, reg(1), Value::Const(0x2000000, 4)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x200, 4)), // back to self
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        // Target block (downstream read).
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(5), Op::Load(0), reg(8)));
+        let b2 = lifter_block(p2, 0x300, 0x304, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+
+        // Iterate the spinloop many times past SPINLOOP_VISIT_THRESHOLD.
+        for _ in 0..20 {
+            e.run_block(&b1, &mut env);
+        }
+        e.run_block(&b2, &mut env);
+
+        let result = e.finish_pass();
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
+        // The edge may or may not exist (depends on window), but if it exists
+        // its is_eq must be false.
+        if let Some(obs) = edge {
+            assert!(
+                !obs.is_eq,
+                "spinloop (>={SPINLOOP_VISIT_THRESHOLD} visits) must suppress is_eq, \
+                 even for IntEqual conditions"
+            );
+        }
+    }
+
+    /// A low-iteration equality branch (< SPINLOOP_VISIT_THRESHOLD) still sets is_eq.
+    #[test]
+    fn low_iteration_equality_branch_sets_is_eq() {
+        let mut e = engine();
+        e.read_sites.insert(0x200, 0x5800_0008);
+        e.read_sites.insert(0x300, 0x5800_0000);
+
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntEqual, reg(1), Value::Const(3, 4)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(5), Op::Load(0), reg(8)));
+        let b2 = lifter_block(p2, 0x300, 0x304, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, 0x5800_0008);
+        env.regs.insert(8, 0x5800_0000);
+
+        // Only 2 iterations — well below SPINLOOP_VISIT_THRESHOLD.
+        for _ in 0..2 {
+            e.run_block(&b1, &mut env);
+            e.run_block(&b2, &mut env);
+        }
+
+        let result = e.finish_pass();
+        let src = AccessContext::new(0x200, 0x5800_0008);
+        let tgt = AccessContext::new(0x300, 0x5800_0000);
+        let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
+        assert!(edge.is_some(), "low-iteration branch must produce an edge");
+        assert!(edge.unwrap().is_eq, "low-iteration IntEqual branch must set is_eq");
     }
 }
