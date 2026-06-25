@@ -21,6 +21,12 @@ use crate::{
 /// partners (governor/dependent) in the same round.
 const COUPLED_MUTATION_PROB: f64 = 0.25;
 
+/// Probability that mutating a stream that belongs to a conjunctive (joint) group
+/// co-mutates ALL of its present partners together in the same input.  A guard
+/// `A==X && B==Y` is only opened when A and B are set jointly; one-at-a-time
+/// coupling (`COUPLED_MUTATION_PROB`) almost never lands both in one input.
+const JOINT_MUTATION_PROB: f64 = 0.30;
+
 /// Probability that a selected Length-source stream triggers an OVERFLOW-PROBE
 /// instead of a random mutation.  OVERFLOW-PROBE sets the source to a value
 /// that maps B's expected size to a known boundary (0, 1, max, 2^n …), directly
@@ -67,6 +73,10 @@ pub(crate) struct HavocStage {
     /// observed to open the path to a governed target.  The source PC targets the
     /// injection at the bytes the governing context reads.
     discriminants: HashMap<StreamKey, Vec<(u64, u64)>>,
+    /// For each present stream, the OTHER present members of every conjunctive
+    /// (joint) group it belongs to — the partners that must be set together to
+    /// satisfy a multi-way guard.  Deduped across all the stream's groups.
+    joint_partners: HashMap<StreamKey, Vec<StreamKey>>,
     /// Per-context `[start, end)` byte ranges from the most recent execution, keyed
     /// by `(pc, addr)`.  Directional writes look up the exact source context's slice
     /// so the value lands where the governing read consumes, instead of aggregating
@@ -116,6 +126,10 @@ impl StageData for HavocStage {
         // concrete values Phase B saw open the path to a governed target.
         let discriminants = collect_discriminants(&fuzzer.relation_graph, &streams);
 
+        // Conjunctive (joint) co-mutation partners: for each present stream, the
+        // other present members of every AND-group it belongs to.
+        let joint_partners = collect_joint_partners(&fuzzer.relation_graph, &streams);
+
         let stream_distr = get_stream_weights(fuzzer, id, &streams, &frontier_boosts);
         let mutator = HavocMutator::new();
         let attempts = calculate_energy(fuzzer) as u32;
@@ -151,6 +165,7 @@ impl StageData for HavocStage {
             length_rel,
             splice_candidates,
             discriminants,
+            joint_partners,
             read_slices,
             saved: false,
         })
@@ -255,17 +270,42 @@ impl HavocStage {
                 }
             }
 
-            // Coupled mutation: with some probability also evolve one of `key`'s
-            // dependency partners so related streams move together.
-            let partner = self.coupled.get(&key).filter(|r| !r.is_empty()).and_then(|r| {
-                fuzzer
-                    .rng
-                    .gen_bool(COUPLED_MUTATION_PROB)
-                    .then(|| r[fuzzer.rng.gen_range(0..r.len())])
-            });
-            if let Some(key2) = partner {
-                self.mutate_stream(fuzzer, key2, 1 + num_mutations / 2);
-                self.preserve_length(fuzzer, key, key2);
+            // Joint (conjunctive) co-mutation: when `key` belongs to an AND-group
+            // whose other members are also present, evolve ALL of them together in
+            // this one input so a multi-way guard `A==X && B==Y` can be satisfied at
+            // once.  Each partner is set to a known discriminant when one exists,
+            // else randomly mutated.  This is the payoff of the composite layer —
+            // one-at-a-time coupling cannot reach a conjunctive condition.
+            let did_joint = match self.joint_partners.get(&key) {
+                Some(partners)
+                    if !partners.is_empty() && fuzzer.rng.gen_bool(JOINT_MUTATION_PROB) =>
+                {
+                    for p in partners.clone() {
+                        if self.discriminants.get(&p).map_or(false, |v| !v.is_empty()) {
+                            self.inject_discriminant(fuzzer, p);
+                        } else {
+                            self.mutate_stream(fuzzer, p, 1 + num_mutations / 2);
+                        }
+                        self.preserve_length(fuzzer, key, p);
+                    }
+                    true
+                }
+                _ => false,
+            };
+
+            // Coupled mutation: otherwise, with some probability evolve one of
+            // `key`'s dependency partners so related streams move together.
+            if !did_joint {
+                let partner = self.coupled.get(&key).filter(|r| !r.is_empty()).and_then(|r| {
+                    fuzzer
+                        .rng
+                        .gen_bool(COUPLED_MUTATION_PROB)
+                        .then(|| r[fuzzer.rng.gen_range(0..r.len())])
+                });
+                if let Some(key2) = partner {
+                    self.mutate_stream(fuzzer, key2, 1 + num_mutations / 2);
+                    self.preserve_length(fuzzer, key, key2);
+                }
             }
         }
     }
@@ -745,6 +785,38 @@ fn collect_discriminants(
     map
 }
 
+/// Collect conjunctive (joint) co-mutation partners from the composite layer.
+///
+/// For each present stream, gather the OTHER present members of every AND-group it
+/// belongs to.  Restricting to *present* partners keeps co-mutation actionable: a
+/// member absent from this input has no bytes to set, and growing it is the job of
+/// the normal extension path.  (`Branch`-anchored groups gating an uncovered
+/// successor are still included as long as ≥2 members are present in this input.)
+fn collect_joint_partners(
+    graph: &StreamRelationGraph,
+    streams: &[(StreamKey, usize)],
+) -> HashMap<StreamKey, Vec<StreamKey>> {
+    let mut map: HashMap<StreamKey, Vec<StreamKey>> = HashMap::new();
+    if !graph.assist_enabled() {
+        return map;
+    }
+    let present: HashSet<StreamKey> = streams.iter().map(|(k, _)| *k).collect();
+    for &(key, _) in streams {
+        let mut partners: Vec<StreamKey> = Vec::new();
+        for comp in graph.composites_for_member(key) {
+            for &s in &comp.sources {
+                if s != key && present.contains(&s) && !partners.contains(&s) {
+                    partners.push(s);
+                }
+            }
+        }
+        if !partners.is_empty() {
+            map.insert(key, partners);
+        }
+    }
+    map
+}
+
 /// Boundary byte-counts to probe for a target stream of `current_len` bytes.
 ///
 /// Covers: underflow (0, 1, 2), common powers-of-two, large-value overflows,
@@ -797,12 +869,64 @@ mod tests {
     use crate::{
         input::{MultiStream, StreamData},
         queue::CorpusStore,
-        stream_relation::{AccessContext, EdgeKind, RelKind, Relation, StreamRelationGraph},
+        stream_relation::{
+            AccessContext, CompositeAnchor, EdgeKind, RelKind, Relation, StreamRelationGraph,
+        },
         State,
     };
 
     fn ac(pc: u64, addr: StreamKey) -> AccessContext {
         AccessContext::new(pc, addr)
+    }
+
+    // ── collect_joint_partners ────────────────────────────────────────────────
+
+    /// A present stream in a conjunctive group reports its other PRESENT members
+    /// as joint partners; an absent member is excluded (nothing to co-mutate).
+    #[test]
+    fn joint_partners_link_present_members_only() {
+        let a = 0x4002_1000u64;
+        let b = 0x4002_1004u64;
+        let absent = 0x4002_1008u64;
+
+        let mut graph = StreamRelationGraph::new();
+        graph.insert_or_merge_composite(
+            vec![a, b, absent],
+            CompositeAnchor::Branch(0xbeef),
+            EdgeKind::Control,
+        );
+
+        let streams = vec![(a, 4usize), (b, 4usize)];
+        let partners = collect_joint_partners(&graph, &streams);
+
+        assert_eq!(partners.get(&a).map(|v| v.as_slice()), Some([b].as_slice()),
+            "a's present partner is b (absent member excluded)");
+        assert_eq!(partners.get(&b).map(|v| v.as_slice()), Some([a].as_slice()),
+            "b's present partner is a");
+    }
+
+    /// With assist disabled, no joint partners are produced (ablation arm).
+    #[test]
+    fn joint_partners_empty_when_assist_disabled() {
+        let a = 0x4002_1000u64;
+        let b = 0x4002_1004u64;
+        let mut graph = StreamRelationGraph::new();
+        graph.insert_or_merge_composite(vec![a, b], CompositeAnchor::Branch(0x10), EdgeKind::Control);
+        graph.set_assist_enabled(false);
+        let partners = collect_joint_partners(&graph, &[(a, 4), (b, 4)]);
+        assert!(partners.is_empty(), "no joint partners when assist disabled");
+    }
+
+    /// A lone present member of a group has no present partners → no entry.
+    #[test]
+    fn joint_partners_omit_lonely_member() {
+        let a = 0x4002_1000u64;
+        let b = 0x4002_1004u64;
+        let mut graph = StreamRelationGraph::new();
+        graph.insert_or_merge_composite(vec![a, b], CompositeAnchor::Branch(0x10), EdgeKind::Control);
+        // Only `a` is present in this input.
+        let partners = collect_joint_partners(&graph, &[(a, 4)]);
+        assert!(partners.get(&a).is_none(), "no present partner ⇒ no joint entry");
     }
 
     // ── build_coupling ────────────────────────────────────────────────────────

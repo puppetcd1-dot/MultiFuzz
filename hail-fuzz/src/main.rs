@@ -862,9 +862,10 @@ impl Fuzzer {
         );
 
         tracing::debug!(
-            "Phase B pass complete in {:.1}ms: {} edges in graph",
+            "Phase B pass complete in {:.1}ms: {} edges, {} joint groups in graph",
             pass_start.elapsed().as_secs_f64() * 1000.0,
             self.relation_graph.edge_count(),
+            self.relation_graph.composite_count(),
         );
     }
 

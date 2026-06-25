@@ -15,7 +15,7 @@ use pcode::{Op, Value, VarId, VarNode};
 
 use crate::{
     input::StreamKey,
-    stream_relation::{AccessContext, EdgeKind, Relation, StreamRelationGraph},
+    stream_relation::{AccessContext, CompositeAnchor, EdgeKind, Relation, StreamRelationGraph},
     taint::{ShadowState, TaintTag},
 };
 
@@ -80,10 +80,22 @@ pub struct ControlEdgeObs {
     pub sample: Option<(u64, u64)>,
 }
 
+/// A conjunctive ("joint") source set discovered in one pass, with the context it
+/// jointly governs.  Sources are distinct stream addresses (always ≥ 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeGroup {
+    pub sources: Vec<StreamKey>,
+    pub anchor: CompositeAnchor,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PassResult {
     pub address_edges: Vec<(AccessContext, AccessContext)>,
     pub control_edges: Vec<ControlEdgeObs>,
+    /// Conjunctive control groups: source sets that jointly gate a branch/target.
+    pub control_groups: Vec<CompositeGroup>,
+    /// Conjunctive address groups: source sets that jointly compute a target address.
+    pub address_groups: Vec<CompositeGroup>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -178,6 +190,15 @@ pub struct PhaseBEngine {
     gating_window: u64,
     addr_edges: HashSet<(AccessContext, AccessContext)>,
     ctrl_obs: HashMap<(AccessContext, AccessContext), CtrlObs>,
+    /// Conjunctive control sources per gating branch: the full taint set of a
+    /// single branch condition is an AND-group (`A==X && B==Y` → {A,B}).
+    ctrl_group_sources: HashMap<u64, HashSet<AccessContext>>,
+    /// A representative target read gated by each branch, used to anchor its group
+    /// to a covered `Target` rather than the uncovered `Branch` when one exists.
+    ctrl_group_target: HashMap<u64, AccessContext>,
+    /// Conjunctive address sources per target read: the full taint set feeding one
+    /// load's address computation is an AND-group.
+    addr_group_sources: HashMap<AccessContext, HashSet<AccessContext>>,
     /// Per-address function summaries.  Not cleared between passes — populated once
     /// at startup from user configuration (e.g. `PHASE_B_MEMCPY_ADDR` env var).
     pub(crate) summaries: HashMap<u64, FuncSummary>,
@@ -209,6 +230,9 @@ impl PhaseBEngine {
             gating_window,
             addr_edges: HashSet::new(),
             ctrl_obs: HashMap::new(),
+            ctrl_group_sources: HashMap::new(),
+            ctrl_group_target: HashMap::new(),
+            addr_group_sources: HashMap::new(),
             summaries: HashMap::new(),
         }
     }
@@ -232,6 +256,9 @@ impl PhaseBEngine {
         self.step = 0;
         self.addr_edges.clear();
         self.ctrl_obs.clear();
+        self.ctrl_group_sources.clear();
+        self.ctrl_group_target.clear();
+        self.addr_group_sources.clear();
     }
 
     // ── value/taint accessors ─────────────────────────────────────────────────
@@ -512,8 +539,15 @@ impl PhaseBEngine {
                         *self.target_reads.entry(ctx).or_insert(0) += 1;
 
                         let addr_tag = self.taint_in(addr_input);
-                        for src in self.contexts_of(&addr_tag) {
+                        let addr_srcs = self.contexts_of(&addr_tag);
+                        for &src in &addr_srcs {
                             if src.addr != ctx.addr { self.addr_edges.insert((src, ctx)); }
+                        }
+                        // Joint address group: ≥2 distinct source addresses feeding
+                        // one load's address computation form an AND-relationship.
+                        let group = self.addr_group_sources.entry(ctx).or_default();
+                        for &src in &addr_srcs {
+                            if src.addr != ctx.addr { group.insert(src); }
                         }
 
                         for i in 0..self.gating.len() {
@@ -527,6 +561,9 @@ impl PhaseBEngine {
                             obs.fires += 1;
                             if self.branch_visits.get(&bpc).copied().unwrap_or(0) >= 2 { obs.is_loop = true; }
                             if self.branch_is_eq.contains(&bpc) { obs.is_eq = true; }
+                            // Anchor this branch's conjunctive control group to a
+                            // covered target read (first one charged wins).
+                            self.ctrl_group_target.entry(bpc).or_insert(ctx);
                         }
 
                         // LiveEnv returns None for MMIO reads (avoids consuming fuzz bytes);
@@ -688,7 +725,8 @@ impl PhaseBEngine {
                             self.branch_is_eq.remove(&bpc);
                         }
                     }
-                    for src in self.contexts_of(&cond_tag) {
+                    let cond_srcs = self.contexts_of(&cond_tag);
+                    for &src in &cond_srcs {
                         let key = (src, bpc);
                         if self.gating_set.insert(key) {
                             self.gating.push(key);
@@ -697,6 +735,12 @@ impl PhaseBEngine {
                         // keep the entry "warm" for targets inside the loop.
                         self.gating_last_step.insert(key, self.step);
                     }
+                    // Joint control group: the full taint of one branch condition is
+                    // a conjunctive AND-set (`A==X && B==Y` taints the condition with
+                    // both A and B).  Accumulate it so finish_pass can emit a single
+                    // composite group instead of independent one-to-one edges.
+                    let group = self.ctrl_group_sources.entry(bpc).or_default();
+                    group.extend(cond_srcs.iter().copied());
                 }
             }
         }
@@ -726,7 +770,41 @@ impl PhaseBEngine {
             });
         }
 
-        PassResult { address_edges, control_edges }
+        // Build conjunctive control groups: distinct source addresses that jointly
+        // gate one branch.  Anchor to a covered target read when one was charged,
+        // else to the (uncovered) branch PC.
+        let mut control_groups = Vec::new();
+        for (&bpc, set) in &self.ctrl_group_sources {
+            let mut sources: Vec<StreamKey> = set.iter().map(|c| c.addr).collect();
+            sources.sort_unstable();
+            sources.dedup();
+            if sources.len() < 2 {
+                continue;
+            }
+            let anchor = match self.ctrl_group_target.get(&bpc) {
+                Some(t) => CompositeAnchor::Target(t.addr),
+                None => CompositeAnchor::Branch(bpc),
+            };
+            control_groups.push(CompositeGroup { sources, anchor });
+        }
+
+        // Build conjunctive address groups: distinct source addresses that jointly
+        // compute one target's load address.
+        let mut address_groups = Vec::new();
+        for (tgt, set) in &self.addr_group_sources {
+            let mut sources: Vec<StreamKey> = set.iter().map(|c| c.addr).collect();
+            sources.sort_unstable();
+            sources.dedup();
+            if sources.len() < 2 {
+                continue;
+            }
+            address_groups.push(CompositeGroup {
+                sources,
+                anchor: CompositeAnchor::Target(tgt.addr),
+            });
+        }
+
+        PassResult { address_edges, control_edges, control_groups, address_groups }
     }
 }
 
@@ -757,6 +835,15 @@ pub fn apply_pass_result(
         }
     }
     graph.backfill_length_relations(store.fitted_relations());
+
+    // Layer the conjunctive (joint) groups on top of the one-to-one edges.  These
+    // express the AND-structure (`A==X && B==Y`) that drives joint co-mutation.
+    for g in result.control_groups {
+        graph.insert_or_merge_composite(g.sources, g.anchor, EdgeKind::Control);
+    }
+    for g in result.address_groups {
+        graph.insert_or_merge_composite(g.sources, g.anchor, EdgeKind::Address);
+    }
 }
 
 fn value_size(v: Value) -> u8 {
@@ -1231,6 +1318,7 @@ mod tests {
                 source: src_a, target: tgt, is_length: true, is_eq: false,
                 sample: Some((4, 4)),
             }],
+            ..Default::default()
         });
         // Pass 2: sample from PC 0x200 → (7, 7)
         // Both should be in the same pool (same stream addresses).
@@ -1240,6 +1328,7 @@ mod tests {
                 source: src_b, target: tgt, is_length: true, is_eq: false,
                 sample: Some((7, 7)),
             }],
+            ..Default::default()
         });
 
         let edge = graph.confirmed_edges().next().expect("edge must be confirmed");
@@ -1265,6 +1354,7 @@ mod tests {
                     source: src, target: tgt, is_length: true, is_eq: false,
                     sample: Some((v, v)),
                 }],
+                ..Default::default()
             });
         }
 
@@ -1293,6 +1383,7 @@ mod tests {
                 source: src, target: tgt, is_length: false, is_eq: true,
                 sample: Some((4, 1)),
             }],
+            ..Default::default()
         });
 
         let edge = graph.confirmed_edges().find(|e| e.source == src && e.target == tgt)
@@ -1318,6 +1409,7 @@ mod tests {
                 source: src, target: tgt, is_length: false, is_eq: true,
                 sample: Some((3, 1)),
             }],
+            ..Default::default()
         });
         // Pass 2: is_eq=false (range check) → value 42 must NOT be recorded.
         apply_pass_result(&mut graph, &mut store, PassResult {
@@ -1326,6 +1418,7 @@ mod tests {
                 source: src, target: tgt, is_length: false, is_eq: false,
                 sample: Some((42, 1)),
             }],
+            ..Default::default()
         });
 
         let edge = graph.confirmed_edges().find(|e| e.source == src && e.target == tgt)
@@ -1350,6 +1443,7 @@ mod tests {
                 source: src, target: tgt, is_length: false, is_eq: true,
                 sample: Some((9, 1)),
             }],
+            ..Default::default()
         });
         assert!(graph.edge_count() > 0, "observation must directly insert an edge");
     }
@@ -1991,5 +2085,105 @@ mod tests {
         let edge = result.control_edges.iter().find(|o| o.source == src && o.target == tgt);
         assert!(edge.is_some(), "same-function gating must still produce an edge");
         assert!(edge.unwrap().is_length, "same-function loop must be classified as Length");
+    }
+
+    // ── Joint (conjunctive) dependency capture ──────────────────────────────
+
+    /// A branch condition tainted by TWO distinct MMIO sources (`A op B`) is a
+    /// conjunctive group: finish_pass emits one control group {A,B}, anchored to
+    /// the target read the branch gates.
+    #[test]
+    fn two_source_branch_condition_emits_joint_control_group() {
+        let mut e = engine();
+        let a_addr: StreamKey = 0x4002_1000;
+        let b_addr: StreamKey = 0x4002_1004;
+        let tgt_addr: StreamKey = 0x4800_0004;
+        e.read_sites.insert(0x200, a_addr);
+        e.read_sites.insert(0x204, b_addr);
+        e.read_sites.insert(0x300, tgt_addr);
+
+        // Block 1: load A and B, combine into the condition (XOR unions taint),
+        // branch on it, then fall through to the gated target read.
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));   // A
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::Load(0), reg(10)));  // B
+        p1.push(marker(0x208));
+        p1.push((reg(3), Op::IntXor, reg(1), reg(2))); // cond depends on A and B
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(3)),
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x20c, exit1);
+
+        // Block 2: the gated target read.
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(5), Op::Load(0), reg(8)));
+        let b2 = lifter_block(p2, 0x300, 0x304, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, a_addr);
+        env.regs.insert(10, b_addr);
+        env.regs.insert(8, tgt_addr);
+
+        e.run_block(&b1, &mut env);
+        e.run_block(&b2, &mut env);
+
+        let result = e.finish_pass();
+        assert_eq!(result.control_groups.len(), 1, "one joint control group expected");
+        let g = &result.control_groups[0];
+        assert_eq!(g.sources, vec![a_addr, b_addr], "both sources captured, sorted");
+        assert_eq!(
+            g.anchor,
+            CompositeAnchor::Target(tgt_addr),
+            "group anchored to the gated target read"
+        );
+
+        // Applying the result populates the graph's composite layer.
+        let mut graph = StreamRelationGraph::new();
+        let mut store = LengthSampleStore::new();
+        apply_pass_result(&mut graph, &mut store, result);
+        assert_eq!(graph.composite_count(), 1);
+        assert_eq!(graph.composites_for_member(a_addr).count(), 1);
+        assert_eq!(graph.composites_for_member(b_addr).count(), 1);
+    }
+
+    /// A single-source branch condition is NOT a joint group (one-to-one suffices).
+    #[test]
+    fn single_source_branch_condition_emits_no_joint_group() {
+        let mut e = engine();
+        let a_addr: StreamKey = 0x4002_1000;
+        let tgt_addr: StreamKey = 0x4800_0004;
+        e.read_sites.insert(0x200, a_addr);
+        e.read_sites.insert(0x300, tgt_addr);
+
+        let mut p1 = pcode::Block::new();
+        p1.push(marker(0x200));
+        p1.push((reg(1), Op::Load(0), reg(9)));
+        p1.push(marker(0x204));
+        p1.push((reg(2), Op::IntEqual, reg(1), Value::Const(0x5, 4)));
+        let exit1 = BlockExit::Branch {
+            cond: Value::Var(reg(2)),
+            target: Target::External(Value::Const(0x300, 4)),
+            fallthrough: Target::External(Value::Const(0x400, 4)),
+        };
+        let b1 = lifter_block(p1, 0x200, 0x208, exit1);
+
+        let mut p2 = pcode::Block::new();
+        p2.push(marker(0x300));
+        p2.push((reg(5), Op::Load(0), reg(8)));
+        let b2 = lifter_block(p2, 0x300, 0x304, BlockExit::invalid());
+
+        let mut env = MockEnv::new();
+        env.regs.insert(9, a_addr);
+        env.regs.insert(8, tgt_addr);
+        e.run_block(&b1, &mut env);
+        e.run_block(&b2, &mut env);
+
+        let result = e.finish_pass();
+        assert!(result.control_groups.is_empty(), "single source is not a joint group");
     }
 }

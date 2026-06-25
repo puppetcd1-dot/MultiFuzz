@@ -20,7 +20,7 @@ impl AccessContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EdgeKind {
     /// Value of source stream was used to compute the MMIO address of target.
     Address,
@@ -140,11 +140,48 @@ pub struct StreamEdge {
     pub value_set:  Vec<(u64, u32)>,
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Composite (joint / conjunctive) edges
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// What a conjunctive source set jointly governs.
+///
+/// Two one-to-one edges that were observed governing the *same* branch (or feeding
+/// the *same* target's address) in a single Phase B observation are really one
+/// AND-relationship: all of their sources must be set together.  The anchor is the
+/// distinguishing context — a covered target read, or an uncovered frontier branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompositeAnchor {
+    /// The set jointly gates / addresses this covered target read.
+    Target(StreamKey),
+    /// The set jointly gates this branch (its interesting successor is uncovered,
+    /// so there is no target read to anchor to — only the branch PC).
+    Branch(u64),
+}
+
+/// A conjunctive ("joint") dependency: a SET of source streams whose values must be
+/// set *together* to govern the anchor.  Captured when one branch condition or one
+/// address computation depends on more than one distinct source stream in a single
+/// Phase B observation — the AND-structure that one-to-one edges cannot express.
+#[derive(Debug, Clone)]
+pub struct CompositeEdge {
+    /// Distinct source stream addresses, sorted and deduped (always ≥ 2).
+    pub sources: Vec<StreamKey>,
+    pub anchor:  CompositeAnchor,
+    pub kind:    EdgeKind,
+}
+
 #[derive(Default)]
 pub struct StreamRelationGraph {
     pub edges:    Vec<StreamEdge>,
     outgoing: HashMap<StreamKey, Vec<usize>>,
     incoming: HashMap<StreamKey, Vec<usize>>,
+    /// Joint/conjunctive edges, layered additively on top of the one-to-one graph.
+    composites: Vec<CompositeEdge>,
+    /// `(anchor, kind)` → composite index, for union-merging repeat observations.
+    composite_by_anchor: HashMap<(CompositeAnchor, EdgeKind), usize>,
+    /// Source address → composite indices it participates in.
+    composite_members: HashMap<StreamKey, Vec<usize>>,
     assist_enabled: bool,
 }
 
@@ -252,6 +289,60 @@ impl StreamRelationGraph {
         }
     }
 
+    /// Insert (or union-merge) a conjunctive source set governing `anchor`.
+    ///
+    /// Sets with fewer than two distinct sources are not "joint" and are dropped —
+    /// the one-to-one layer already represents them.  Repeat observations of the
+    /// same `(anchor, kind)` union their sources, so a guard `A==X && B==Y && C==Z`
+    /// seen across passes accretes into a single `{A,B,C}` group.
+    pub fn insert_or_merge_composite(
+        &mut self,
+        mut sources: Vec<StreamKey>,
+        anchor: CompositeAnchor,
+        kind: EdgeKind,
+    ) {
+        if !self.assist_enabled {
+            return;
+        }
+        sources.sort_unstable();
+        sources.dedup();
+        if sources.len() < 2 {
+            return;
+        }
+        let akey = (anchor, kind);
+        if let Some(&idx) = self.composite_by_anchor.get(&akey) {
+            // Union the new sources into the existing group (borrow-safe: resolve
+            // the additions before mutating either store).
+            let existing: HashMap<StreamKey, ()> =
+                self.composites[idx].sources.iter().map(|&s| (s, ())).collect();
+            let additions: Vec<StreamKey> =
+                sources.into_iter().filter(|s| !existing.contains_key(s)).collect();
+            for &s in &additions {
+                self.composite_members.entry(s).or_default().push(idx);
+            }
+            let edge = &mut self.composites[idx];
+            edge.sources.extend(additions);
+            edge.sources.sort_unstable();
+            return;
+        }
+        let idx = self.composites.len();
+        for &s in &sources {
+            self.composite_members.entry(s).or_default().push(idx);
+        }
+        self.composites.push(CompositeEdge { sources, anchor, kind });
+        self.composite_by_anchor.insert(akey, idx);
+    }
+
+    /// Conjunctive groups that `addr` participates in (as one of the joint sources).
+    pub fn composites_for_member(&self, addr: StreamKey) -> impl Iterator<Item = &CompositeEdge> {
+        let idxs = self.composite_members.get(&addr).map(|v| v.as_slice()).unwrap_or(&[]);
+        idxs.iter().map(move |&i| &self.composites[i])
+    }
+
+    pub fn composite_count(&self) -> usize {
+        self.composites.len()
+    }
+
     #[cfg(test)]
     pub fn governors(&self, target: StreamKey) -> impl Iterator<Item = &StreamEdge> {
         let indices = self.incoming.get(&target).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -340,6 +431,33 @@ impl StreamRelationGraph {
                  \"values\":[{}]}}",
                 e.source.pc, e.source.addr, e.target.pc, e.target.addr,
                 e.kind, relation, values
+            ));
+        }
+        s.push_str("\n]\n");
+        s
+    }
+
+    /// Dump the conjunctive (joint) edges as a JSON array, kept separate from
+    /// `to_json` so the one-to-one schema consumers rely on stays unchanged.
+    pub fn composites_to_json(&self) -> String {
+        let mut s = String::from("[\n");
+        for (i, c) in self.composites.iter().enumerate() {
+            if i > 0 {
+                s.push_str(",\n");
+            }
+            let anchor = match c.anchor {
+                CompositeAnchor::Target(addr) => format!("\"target:{addr:#x}\""),
+                CompositeAnchor::Branch(pc) => format!("\"branch:{pc:#x}\""),
+            };
+            let sources = c
+                .sources
+                .iter()
+                .map(|a| format!("\"{a:#x}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            s.push_str(&format!(
+                "  {{\"kind\":\"{:?}\",\"join\":\"Conjunctive\",\"anchor\":{},\"sources\":[{}]}}",
+                c.kind, anchor, sources
             ));
         }
         s.push_str("\n]\n");
@@ -665,6 +783,63 @@ mod tests {
         // the mutation engine, without collapsing the underlying context nodes.
         let govs_b = g.get_governors_by_addr(b);
         assert_eq!(govs_b, vec![(a, EdgeKind::Control)]);
+    }
+
+    /// A conjunctive group with ≥2 distinct sources is stored, indexed by every
+    /// member, and anchored; sets with <2 sources are dropped (one-to-one suffices).
+    #[test]
+    fn composite_insert_indexes_members_and_rejects_singletons() {
+        let mut g = StreamRelationGraph::new();
+        let a: StreamKey = 0x4002_1000;
+        let b: StreamKey = 0x4800_0004;
+        let target: StreamKey = 0x4001_3800;
+
+        g.insert_or_merge_composite(vec![a, b], CompositeAnchor::Target(target), EdgeKind::Control);
+        assert_eq!(g.composite_count(), 1, "joint group with 2 sources is stored");
+
+        // Both members index back to the same group.
+        assert_eq!(g.composites_for_member(a).count(), 1);
+        assert_eq!(g.composites_for_member(b).count(), 1);
+        let comp = g.composites_for_member(a).next().unwrap();
+        assert_eq!(comp.sources, vec![a, b], "sources sorted and deduped");
+        assert_eq!(comp.anchor, CompositeAnchor::Target(target));
+
+        // A singleton "group" is not joint — dropped.
+        g.insert_or_merge_composite(vec![a], CompositeAnchor::Branch(0x1234), EdgeKind::Control);
+        assert_eq!(g.composite_count(), 1, "singleton group must be dropped");
+    }
+
+    /// Repeat observations of the same (anchor, kind) union their sources into one
+    /// group, so a 3-way guard seen across passes accretes to {A,B,C}.
+    #[test]
+    fn composite_merge_unions_sources_for_same_anchor() {
+        let mut g = StreamRelationGraph::new();
+        let a: StreamKey = 0x1000;
+        let b: StreamKey = 0x2000;
+        let c: StreamKey = 0x3000;
+        let anchor = CompositeAnchor::Branch(0xbeef);
+
+        g.insert_or_merge_composite(vec![a, b], anchor, EdgeKind::Control);
+        g.insert_or_merge_composite(vec![b, c], anchor, EdgeKind::Control);
+        assert_eq!(g.composite_count(), 1, "same anchor+kind merges into one group");
+
+        let comp = g.composites_for_member(a).next().unwrap();
+        assert_eq!(comp.sources, vec![a, b, c], "sources unioned across observations");
+        // The newly-added member c indexes back to the merged group.
+        assert_eq!(g.composites_for_member(c).count(), 1);
+
+        // A different kind at the same anchor is a distinct group.
+        g.insert_or_merge_composite(vec![a, b], anchor, EdgeKind::Address);
+        assert_eq!(g.composite_count(), 2, "distinct kind ⇒ distinct group");
+    }
+
+    /// Composites are gated by the assist flag, like every other assistance feature.
+    #[test]
+    fn composite_insert_respects_assist_flag() {
+        let mut g = StreamRelationGraph::new();
+        g.set_assist_enabled(false);
+        g.insert_or_merge_composite(vec![0x1, 0x2], CompositeAnchor::Branch(0x10), EdgeKind::Control);
+        assert_eq!(g.composite_count(), 0, "no composites recorded when assist disabled");
     }
 
     /// `get_governors_by_addr` returns deduplicated (source_addr, kind) pairs

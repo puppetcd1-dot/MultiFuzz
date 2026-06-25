@@ -393,6 +393,10 @@ impl FuzzerStage for MultiStreamExtendStage {
                         fuzzer.workdir.join("relations.json"),
                         fuzzer.relation_graph.to_json(),
                     );
+                    let _ = std::fs::write(
+                        fuzzer.workdir.join("composites.json"),
+                        fuzzer.relation_graph.composites_to_json(),
+                    );
                 }
             }
         }
