@@ -27,6 +27,22 @@ impl Clone for StreamData {
     }
 
     fn clone_from(&mut self, source: &Self) {
+        // Defensive: detect obviously corrupted Vec metadata before dereferencing
+        // the data pointer.  A capacity above 256 MB is impossible for a single
+        // MMIO byte stream and signals heap corruption.
+        const MAX_SANE_CAP: usize = 256 * 1024 * 1024;
+        if source.bytes.capacity() > MAX_SANE_CAP || source.bytes.len() > source.bytes.capacity() {
+            tracing::error!(
+                "StreamData::clone_from: source Vec metadata looks corrupted \
+                 (len={}, cap={}); skipping clone to avoid SIGSEGV",
+                source.bytes.len(),
+                source.bytes.capacity(),
+            );
+            self.bytes.clear();
+            self.cursor = 0;
+            self.sizes = 0;
+            return;
+        }
         self.bytes.clone_from(&source.bytes);
         self.cursor = source.cursor;
         self.sizes = source.sizes;

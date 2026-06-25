@@ -819,8 +819,10 @@ struct PhaseBInjector {
     hook: pcode::HookId,
 }
 
-/// Cap on the cached-block count (~80 MB at 200k entries).
-const MAX_BLOCK_CACHE: usize = 200_000;
+/// Cap on the cached-block count.  The original 200k was ~80 MB and created
+/// sustained allocation pressure over multi-hour runs; 50k covers the vast
+/// majority of Cortex-M firmware while keeping the footprint under ~20 MB.
+const MAX_BLOCK_CACHE: usize = 50_000;
 
 impl icicle_vm::CodeInjector for PhaseBInjector {
     /// Inject only into the group's entry block (`group.blocks.0`), mirroring
@@ -891,12 +893,13 @@ pub fn install(vm: &mut Vm, mmio_ranges: Vec<Range<u64>>) -> (Rc<RefCell<PhaseBS
             let cpu = unsafe { &mut *cpu_raw };
             let Ok(mut st) = hook_state.try_borrow_mut() else { return; };
             if !st.armed { return; }
-            let st = &mut *st;
-            if let Some(group) = st.blocks.get(&addr) {
-                let blocks = group.blocks.clone();
-                let base = group.base;
-                let mut env = LiveEnv { cpu, mmio_ranges: &st.mmio_ranges };
-                st.engine.run_group(&blocks, base, &mut env);
+            // Destructure so `blocks` and `engine` can be borrowed independently,
+            // eliminating the per-hook Vec<Block> clone that created heavy allocation
+            // pressure over long runs.
+            let PhaseBState { blocks, engine, mmio_ranges, .. } = &mut *st;
+            if let Some(group) = blocks.get(&addr) {
+                let mut env = LiveEnv { cpu, mmio_ranges };
+                engine.run_group(&group.blocks, group.base, &mut env);
             }
         }));
         if result.is_err() {
