@@ -363,28 +363,26 @@ impl FuzzerStage for MultiStreamExtendStage {
             save_metadata(fuzzer, &state);
             fuzzer.update_stats(stats);
 
-            // Hybrid trigger: if this execution hit a frontier branch but did not
-            // produce new coverage, trigger Phase B to discover dependencies that
-            // may help unlock the uncovered successor.
+            // Hybrid trigger: if this execution stopped at a frontier branch but did
+            // not produce new coverage, trigger Phase B to discover the dependencies
+            // that may unlock the uncovered successor.
             //
-            // Time-based cooldown: wait at least `min_interval` since the last
-            // hybrid pass.  The minimum interval adapts to the actual Phase B pass
-            // duration — at least 10× the pass time, floored at 5 s and capped at
-            // 60 s.  This prevents meltdown when coverage plateaus: without it,
-            // the count-based cooldown fires every fraction of a second but each
-            // pass takes 10+ seconds, spending ~96% of time in Phase B.
+            // Deterministic per-frontier budget (NOT wall-clock): each frontier
+            // branch may be analysed at most `MAX_PHASE_B_PER_FRONTIER` times on a
+            // given coverage state.  Re-running Phase B for a branch already analysed
+            // on the same corpus yields nothing new, so once every live frontier has
+            // spent its budget the trigger goes quiet — no meltdown when coverage
+            // plateaus.  New coverage recomputes (and prunes) the frontier, which
+            // re-opens budget exactly where there is fresh code to reach.  The trigger
+            // depends only on coverage state and the hit branch PC, so runs replicate.
+            const MAX_PHASE_B_PER_FRONTIER: u32 = 2;
             if !do_phase_b && fuzzer.phase_b.is_some() && !fuzzer.state.new_coverage {
-                let min_interval = {
-                    let adaptive = fuzzer.phase_b_last_duration.mul_f64(10.0);
-                    let floor = std::time::Duration::from_secs(5);
-                    let cap = std::time::Duration::from_secs(60);
-                    adaptive.max(floor).min(cap)
-                };
-                if fuzzer.phase_b_last_hybrid.elapsed() >= min_interval
-                    && fuzzer.check_frontier_hit()
-                {
-                    do_phase_b = true;
-                    fuzzer.phase_b_last_hybrid = std::time::Instant::now();
+                if let Some(bpc) = fuzzer.frontier_hit_pc() {
+                    let spent = fuzzer.phase_b_frontier_budget.entry(bpc).or_insert(0);
+                    if *spent < MAX_PHASE_B_PER_FRONTIER {
+                        *spent += 1;
+                        do_phase_b = true;
+                    }
                 }
             }
 

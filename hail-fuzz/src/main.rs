@@ -567,10 +567,13 @@ pub(crate) struct Fuzzer {
     pub length_store: phase_b::LengthSampleStore,
     /// Counter used to sample which new-stream events trigger a Phase B taint pass.
     pub phase_b_counter: u64,
-    /// Timestamp of the last Phase B hybrid trigger, used for time-based cooldown.
-    pub phase_b_last_hybrid: std::time::Instant,
-    /// Duration of the most recent Phase B pass, used for adaptive cooldown.
-    pub phase_b_last_duration: std::time::Duration,
+    /// Deterministic hybrid-trigger budget: maps each frontier branch PC to the
+    /// number of Phase B passes already spent analysing it.  A branch is eligible
+    /// for a (re)analysis only while its count is below `MAX_PHASE_B_PER_FRONTIER`.
+    /// Pruned to the live frontier on every recompute, so a branch that leaves and
+    /// later re-enters the frontier earns a fresh budget.  Depends only on coverage
+    /// state and which branch was hit — never on wall-clock — so runs replicate.
+    pub phase_b_frontier_budget: HashMap<u64, u32>,
     /// Coverage-directed mutation weights: maps each MMIO stream that gates an uncovered
     /// frontier branch to a boost factor (≥ 1.0).  Recomputed periodically from the true
     /// coverage frontier (see `maybe_recompute_frontier`); empty when assistance is disabled.
@@ -751,8 +754,7 @@ impl Fuzzer {
             phase_b_armed,
             length_store: phase_b::LengthSampleStore::new(),
             phase_b_counter: 0,
-            phase_b_last_hybrid: std::time::Instant::now(),
-            phase_b_last_duration: std::time::Duration::ZERO,
+            phase_b_frontier_budget: HashMap::new(),
             frontier_weights: HashMap::new(),
             frontier_block_count: 0,
             stagnation: HashMap::new(),
@@ -790,6 +792,10 @@ impl Fuzzer {
             &self.stagnation,
         );
         self.frontier_branches = mmio_flow::compute_frontier_branch_set(&self.vm.code);
+        // Prune hybrid-trigger budget to the live frontier: branches no longer on
+        // the frontier drop their spend, so one that later re-enters earns a fresh
+        // analysis budget.  Keeps the map bounded by |frontier|.
+        self.phase_b_frontier_budget.retain(|pc, _| self.frontier_branches.contains(pc));
         tracing::debug!(
             "frontier weights recomputed from {lifted} lifted blocks: {} gating stream(s), {} frontier branches",
             weights.len(),
@@ -855,24 +861,22 @@ impl Fuzzer {
             result,
         );
 
-        let elapsed = pass_start.elapsed();
-        self.phase_b_last_duration = elapsed;
         tracing::debug!(
             "Phase B pass complete in {:.1}ms: {} edges in graph",
-            elapsed.as_secs_f64() * 1000.0,
+            pass_start.elapsed().as_secs_f64() * 1000.0,
             self.relation_graph.edge_count(),
         );
     }
 
-    /// Check if the last execution hit any frontier branch block (used for hybrid
-    /// Phase B trigger).  Returns true if the exit PC or known covered blocks
-    /// intersect with the frontier branch set.
-    pub fn check_frontier_hit(&self) -> bool {
+    /// If the last execution stopped at a frontier branch block, return that
+    /// branch's PC (used as the deterministic key for the hybrid Phase B budget).
+    /// Returns `None` when the exit PC is not a known frontier branch.
+    pub fn frontier_hit_pc(&self) -> Option<u64> {
         if self.frontier_branches.is_empty() {
-            return false;
+            return None;
         }
         let exit_pc = self.vm.cpu.read_pc();
-        self.frontier_branches.contains(&exit_pc)
+        self.frontier_branches.contains(&exit_pc).then_some(exit_pc)
     }
 
     /// Runs the VM until it exits or executs `limit` number of instructions and update the current
